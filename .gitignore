@@ -1,0 +1,37 @@
+# Xcode
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+*.xcworkspace/*
+!*.xcworkspace/contents.xcworkspacedata
+
+# Build
+/build
+/DerivedData
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.swiftpm
+.build/
+Package.resolved
+
+# CocoaPods
+Pods/
+*.xcworkspace
+
+# Carthage
+Carthage/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# User settings
+*.pbxuser
+*.perspectivev3
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
