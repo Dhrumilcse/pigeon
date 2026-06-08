@@ -395,23 +395,22 @@ private struct HRVDayRow: View {
 
 // MARK: - Per-day HRV samples
 
+// Same cursor-paginated pattern as DayHRSamplesView. HRV samples are
+// sparser (~1/min vs HR's 1 Hz), so a single day's worth is small, but
+// keeping the pagination matches Apple Health's instant-open behavior and
+// is consistent with the HR side.
 struct DayHRVSamplesView: View {
     let dayStart: Date
-    @Query private var samples: [HRVSample]
+    @Environment(\.modelContext) private var modelContext
+    @State private var samples: [HRVSample] = []
+    @State private var hasMore: Bool = true
+    @State private var isLoading: Bool = false
 
-    init(dayStart: Date) {
-        self.dayStart = dayStart
-        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-        _samples = Query(
-            filter: #Predicate<HRVSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
-            sort: \.timestamp,
-            order: .reverse
-        )
-    }
+    private let pageSize = 100
 
     var body: some View {
         List {
-            if samples.isEmpty {
+            if samples.isEmpty && !hasMore {
                 Section {
                     Text("No samples recorded.")
                         .foregroundColor(.secondary)
@@ -424,12 +423,53 @@ struct DayHRVSamplesView: View {
                             unit: "ms",
                             date: sample.timestamp
                         )
+                        .onAppear {
+                            if sample.persistentModelID == samples.last?.persistentModelID {
+                                loadMore()
+                            }
+                        }
+                    }
+                    if hasMore {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Spacer()
+                        }
                     }
                 }
             }
         }
         .navigationTitle(dayStart.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if samples.isEmpty && hasMore {
+                loadMore()
+            }
+        }
+    }
+
+    private func loadMore() {
+        guard !isLoading, hasMore else { return }
+        isLoading = true
+        defer { isLoading = false }
+
+        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        let cursor = samples.last?.timestamp ?? dayEnd
+        let start = dayStart
+
+        var descriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < cursor },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = pageSize
+
+        do {
+            let page = try modelContext.fetch(descriptor)
+            samples.append(contentsOf: page)
+            hasMore = page.count == pageSize
+        } catch {
+            hasMore = false
+        }
     }
 }
 

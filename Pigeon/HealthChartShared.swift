@@ -341,7 +341,7 @@ struct HealthSampleRow: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
-            Text(date.formatted(.dateTime.hour().minute()))
+            Text(date.formatted(.dateTime.hour().minute().second()))
                 .font(.system(size: 15))
                 .foregroundColor(.secondary)
         }

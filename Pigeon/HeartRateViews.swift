@@ -378,26 +378,24 @@ private struct MonthlyHRAllDataCard: View {
 
 // MARK: - Per-day HR samples
 
-// Lazily lists every HRSample inside [dayStart, dayStart + 1d), newest first.
-// SwiftUI's List virtualizes rows, so even a full 24h of 1Hz samples renders
-// fine.
+// Cursor-paginated list of HRSample rows for a single day, newest first.
+// A `@Query` would load every row up front — for a full 1 Hz day that's
+// ~86,400 rows and a multi-second hitch when opening the screen. We fetch
+// 100 rows per page using `timestamp < cursor` (where cursor = the
+// timestamp of the last loaded row) so SQLite can walk the sort order
+// without scanning past prior pages.
 struct DayHRSamplesView: View {
     let dayStart: Date
-    @Query private var samples: [HRSample]
+    @Environment(\.modelContext) private var modelContext
+    @State private var samples: [HRSample] = []
+    @State private var hasMore: Bool = true
+    @State private var isLoading: Bool = false
 
-    init(dayStart: Date) {
-        self.dayStart = dayStart
-        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-        _samples = Query(
-            filter: #Predicate<HRSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
-            sort: \.timestamp,
-            order: .reverse
-        )
-    }
+    private let pageSize = 100
 
     var body: some View {
         List {
-            if samples.isEmpty {
+            if samples.isEmpty && !hasMore {
                 Section {
                     Text("No samples recorded.")
                         .foregroundColor(.secondary)
@@ -406,12 +404,53 @@ struct DayHRSamplesView: View {
                 Section {
                     ForEach(samples) { sample in
                         HealthSampleRow(value: sample.bpm, unit: "BPM", date: sample.timestamp)
+                            .onAppear {
+                                if sample.persistentModelID == samples.last?.persistentModelID {
+                                    loadMore()
+                                }
+                            }
+                    }
+                    if hasMore {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Spacer()
+                        }
                     }
                 }
             }
         }
         .navigationTitle(dayStart.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if samples.isEmpty && hasMore {
+                loadMore()
+            }
+        }
+    }
+
+    private func loadMore() {
+        guard !isLoading, hasMore else { return }
+        isLoading = true
+        defer { isLoading = false }
+
+        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        let cursor = samples.last?.timestamp ?? dayEnd
+        let start = dayStart
+
+        var descriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate<HRSample> { $0.timestamp >= start && $0.timestamp < cursor },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = pageSize
+
+        do {
+            let page = try modelContext.fetch(descriptor)
+            samples.append(contentsOf: page)
+            hasMore = page.count == pageSize
+        } catch {
+            hasMore = false
+        }
     }
 }
 
