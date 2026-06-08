@@ -128,12 +128,289 @@ struct HeartRateDetailView: View {
                 case .monthly:
                     MonthlyHRChartBody().id(range)
                 }
+
+                HealthOptionsSection(
+                    unitText: "BPM",
+                    showAllData: { ShowAllHRDataView() },
+                    unitPicker: { HealthUnitPickerView(title: "Heart Rate Unit", unit: "BPM") }
+                )
             }
             .padding(.horizontal, Layout.screenHMargin)
             .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - Show All Data (HR)
+
+// Lists every day that has HR samples, newest first. Reads from DailySummary
+// so the list itself stays cheap even with many days of history. Tapping a
+// row drills into the raw HRSample rows for that day.
+struct ShowAllHRDataView: View {
+    @State private var range: HealthTimeRange = .day
+    @Query(
+        filter: #Predicate<DailySummary> { $0.hrSampleCount > 0 },
+        sort: \.date,
+        order: .reverse
+    )
+    private var days: [DailySummary]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                Picker("Range", selection: $range) {
+                    ForEach(HealthTimeRange.allCases) { r in
+                        Text(r.rawValue).tag(r)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                switch range.source {
+                case .hourly:
+                    HourlyHRAllDataCard().id(range)
+                case .daily:
+                    DailyHRAllDataCard(range: range).id(range)
+                case .monthly:
+                    MonthlyHRAllDataCard().id(range)
+                }
+
+                if !days.isEmpty {
+                    HealthDayList(days: days) { day in
+                        NavigationLink {
+                            DayHRSamplesView(dayStart: day.date)
+                        } label: {
+                            HealthDayLinkRow {
+                                HealthDaySummaryRow(
+                                    low: day.minHR,
+                                    high: day.maxHR,
+                                    unit: "BPM",
+                                    date: day.date
+                                )
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("All Recorded Data")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - HR All Data chart bodies (one per range source)
+
+private struct HourlyHRAllDataCard: View {
+    @Query private var rows: [HourlySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init() {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: Date())
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? Date()
+        self.startDate = start
+        self.endDate = end
+        _rows = Query(
+            filter: #Predicate<HourlySummary> { $0.hourStart >= start && $0.hourStart < end && $0.hrSampleCount > 0 },
+            sort: \.hourStart
+        )
+    }
+
+    private var points: [HealthPoint] {
+        rows.map { HealthPoint(date: $0.hourStart, value: Double($0.hrSampleCount)) }
+    }
+
+    private var sampleCount: Int { rows.reduce(0) { $0 + $1.hrSampleCount } }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: startDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()),
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: HealthXStride(component: .hour, count: 6),
+            xFormat: .dateTime.hour(),
+            tooltipDateFormat: .dateTime.hour().minute(),
+            tint: .red,
+            yStep: 10
+        )
+    }
+}
+
+private struct DailyHRAllDataCard: View {
+    let range: HealthTimeRange
+    @Query private var rows: [DailySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init(range: HealthTimeRange) {
+        self.range = range
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: Date())
+        let days: Int
+        switch range {
+        case .week:      days = 7
+        case .month:     days = 30
+        case .sixMonths: days = 180
+        default:         days = 30
+        }
+        let start = cal.date(byAdding: .day, value: -(days - 1), to: todayStart) ?? todayStart
+        let end = cal.date(byAdding: .day, value: 1, to: todayStart) ?? Date()
+        self.startDate = start
+        self.endDate = end
+        _rows = Query(
+            filter: #Predicate<DailySummary> { $0.date >= start && $0.date < end && $0.hrSampleCount > 0 },
+            sort: \.date
+        )
+    }
+
+    private var points: [HealthPoint] {
+        rows.map { HealthPoint(date: $0.date, value: Double($0.hrSampleCount)) }
+    }
+
+    private var sampleCount: Int { rows.reduce(0) { $0 + $1.hrSampleCount } }
+
+    private var dateRangeText: String {
+        let lastDay = Calendar.current.date(byAdding: .day, value: -1, to: endDate) ?? endDate
+        return "\(startDate.formatted(.dateTime.month(.abbreviated).day())) – \(lastDay.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+
+    private var xStride: HealthXStride {
+        switch range {
+        case .week:      return HealthXStride(component: .day, count: 2)
+        case .month:     return HealthXStride(component: .day, count: 7)
+        case .sixMonths: return HealthXStride(component: .month, count: 2)
+        default:         return HealthXStride(component: .day, count: 7)
+        }
+    }
+
+    private var xFormat: Date.FormatStyle {
+        switch range {
+        case .week:      return .dateTime.weekday(.abbreviated)
+        case .sixMonths: return .dateTime.month(.abbreviated)
+        default:         return .dateTime.day()
+        }
+    }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: dateRangeText,
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: xStride,
+            xFormat: xFormat,
+            tooltipDateFormat: .dateTime.month(.abbreviated).day().year(),
+            tint: .red,
+            yStep: 10
+        )
+    }
+}
+
+private struct MonthlyHRAllDataCard: View {
+    // MonthlySummary doesn't carry a sample count, so derive per-month
+    // counts from DailySummary by grouping its rows by month.
+    @Query private var days: [DailySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init() {
+        let cal = Calendar.current
+        let now = Date()
+        let comps = cal.dateComponents([.year, .month], from: now)
+        let thisMonthStart = cal.date(from: comps) ?? now
+        let end = cal.date(byAdding: .month, value: 1, to: thisMonthStart) ?? now
+        let start = cal.date(byAdding: .month, value: -11, to: thisMonthStart) ?? thisMonthStart
+        self.startDate = start
+        self.endDate = end
+        _days = Query(
+            filter: #Predicate<DailySummary> { $0.date >= start && $0.date < end && $0.hrSampleCount > 0 },
+            sort: \.date
+        )
+    }
+
+    private var points: [HealthPoint] {
+        let cal = Calendar.current
+        var byMonth: [Date: Int] = [:]
+        for d in days {
+            let comps = cal.dateComponents([.year, .month], from: d.date)
+            guard let monthStart = cal.date(from: comps) else { continue }
+            byMonth[monthStart, default: 0] += d.hrSampleCount
+        }
+        return byMonth.map { HealthPoint(date: $0.key, value: Double($0.value)) }
+            .sorted { $0.date < $1.date }
+    }
+
+    private var sampleCount: Int { days.reduce(0) { $0 + $1.hrSampleCount } }
+
+    private var dateRangeText: String {
+        let lastMonth = Calendar.current.date(byAdding: .month, value: -1, to: endDate) ?? endDate
+        return "\(startDate.formatted(.dateTime.month(.abbreviated).year())) – \(lastMonth.formatted(.dateTime.month(.abbreviated).year()))"
+    }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: dateRangeText,
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: HealthXStride(component: .month, count: 3),
+            xFormat: .dateTime.month(.abbreviated),
+            tooltipDateFormat: .dateTime.month(.wide).year(),
+            tint: .red,
+            yStep: 10
+        )
+    }
+}
+
+// MARK: - Per-day HR samples
+
+// Lazily lists every HRSample inside [dayStart, dayStart + 1d), newest first.
+// SwiftUI's List virtualizes rows, so even a full 24h of 1Hz samples renders
+// fine.
+struct DayHRSamplesView: View {
+    let dayStart: Date
+    @Query private var samples: [HRSample]
+
+    init(dayStart: Date) {
+        self.dayStart = dayStart
+        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        _samples = Query(
+            filter: #Predicate<HRSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
+            sort: \.timestamp,
+            order: .reverse
+        )
+    }
+
+    var body: some View {
+        List {
+            if samples.isEmpty {
+                Section {
+                    Text("No samples recorded.")
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Section {
+                    ForEach(samples) { sample in
+                        HealthSampleRow(value: sample.bpm, unit: "BPM", date: sample.timestamp)
+                    }
+                }
+            }
+        }
+        .navigationTitle(dayStart.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
         .navigationBarTitleDisplayMode(.inline)
     }
 }

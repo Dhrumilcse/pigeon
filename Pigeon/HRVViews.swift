@@ -126,12 +126,309 @@ struct HRVDetailView: View {
                 case .monthly:
                     MonthlyHRVChartBody().id(range)
                 }
+
+                HealthOptionsSection(
+                    unitText: "ms",
+                    showAllData: { ShowAllHRVDataView() },
+                    unitPicker: { HealthUnitPickerView(title: "HRV Unit", unit: "ms") }
+                )
             }
             .padding(.horizontal, Layout.screenHMargin)
             .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate Variability")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - Show All Data (HRV)
+
+// Lists every day that has HRV samples, newest first. DailySummary doesn't
+// track minHRV/maxHRV, so each row queries its own day's HRVSample to derive
+// low/high. List virtualization keeps it cheap.
+struct ShowAllHRVDataView: View {
+    @State private var range: HealthTimeRange = .day
+    @Query(
+        filter: #Predicate<DailySummary> { $0.hrvSampleCount > 0 },
+        sort: \.date,
+        order: .reverse
+    )
+    private var days: [DailySummary]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                Picker("Range", selection: $range) {
+                    ForEach(HealthTimeRange.allCases) { r in
+                        Text(r.rawValue).tag(r)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                switch range.source {
+                case .hourly:
+                    HourlyHRVAllDataCard().id(range)
+                case .daily:
+                    DailyHRVAllDataCard(range: range).id(range)
+                case .monthly:
+                    MonthlyHRVAllDataCard().id(range)
+                }
+
+                if !days.isEmpty {
+                    HealthDayList(days: days) { day in
+                        NavigationLink {
+                            DayHRVSamplesView(dayStart: day.date)
+                        } label: {
+                            HealthDayLinkRow {
+                                HRVDayRow(dayStart: day.date)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("All Recorded Data")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - HRV All Data chart bodies (one per range source)
+
+// Summary tables track avgHRV but not min/max, so the visualization is a
+// scatter of per-period averages rather than range bars.
+
+private struct HourlyHRVAllDataCard: View {
+    @Query private var rows: [HourlySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init() {
+        let cal = Calendar.current
+        let start = cal.startOfDay(for: Date())
+        let end = cal.date(byAdding: .day, value: 1, to: start) ?? Date()
+        self.startDate = start
+        self.endDate = end
+        _rows = Query(
+            filter: #Predicate<HourlySummary> { $0.hourStart >= start && $0.hourStart < end && $0.hrvSampleCount > 0 },
+            sort: \.hourStart
+        )
+    }
+
+    private var points: [HealthPoint] {
+        rows.map { HealthPoint(date: $0.hourStart, value: Double($0.hrvSampleCount)) }
+    }
+
+    private var sampleCount: Int { rows.reduce(0) { $0 + $1.hrvSampleCount } }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: startDate.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()),
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: HealthXStride(component: .hour, count: 6),
+            xFormat: .dateTime.hour(),
+            tooltipDateFormat: .dateTime.hour().minute(),
+            tint: .purple,
+            yStep: 10
+        )
+    }
+}
+
+private struct DailyHRVAllDataCard: View {
+    let range: HealthTimeRange
+    @Query private var rows: [DailySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init(range: HealthTimeRange) {
+        self.range = range
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: Date())
+        let days: Int
+        switch range {
+        case .week:      days = 7
+        case .month:     days = 30
+        case .sixMonths: days = 180
+        default:         days = 30
+        }
+        let start = cal.date(byAdding: .day, value: -(days - 1), to: todayStart) ?? todayStart
+        let end = cal.date(byAdding: .day, value: 1, to: todayStart) ?? Date()
+        self.startDate = start
+        self.endDate = end
+        _rows = Query(
+            filter: #Predicate<DailySummary> { $0.date >= start && $0.date < end && $0.hrvSampleCount > 0 },
+            sort: \.date
+        )
+    }
+
+    private var points: [HealthPoint] {
+        rows.map { HealthPoint(date: $0.date, value: Double($0.hrvSampleCount)) }
+    }
+
+    private var sampleCount: Int { rows.reduce(0) { $0 + $1.hrvSampleCount } }
+
+    private var dateRangeText: String {
+        let lastDay = Calendar.current.date(byAdding: .day, value: -1, to: endDate) ?? endDate
+        return "\(startDate.formatted(.dateTime.month(.abbreviated).day())) – \(lastDay.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+
+    private var xStride: HealthXStride {
+        switch range {
+        case .week:      return HealthXStride(component: .day, count: 2)
+        case .month:     return HealthXStride(component: .day, count: 7)
+        case .sixMonths: return HealthXStride(component: .month, count: 2)
+        default:         return HealthXStride(component: .day, count: 7)
+        }
+    }
+
+    private var xFormat: Date.FormatStyle {
+        switch range {
+        case .week:      return .dateTime.weekday(.abbreviated)
+        case .sixMonths: return .dateTime.month(.abbreviated)
+        default:         return .dateTime.day()
+        }
+    }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: dateRangeText,
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: xStride,
+            xFormat: xFormat,
+            tooltipDateFormat: .dateTime.month(.abbreviated).day().year(),
+            tint: .purple,
+            yStep: 10
+        )
+    }
+}
+
+private struct MonthlyHRVAllDataCard: View {
+    // Per-month HRV sample counts: group DailySummary by month (neither
+    // MonthlySummary nor any other table stores hrvSampleCount per month).
+    @Query private var days: [DailySummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init() {
+        let cal = Calendar.current
+        let now = Date()
+        let comps = cal.dateComponents([.year, .month], from: now)
+        let thisMonthStart = cal.date(from: comps) ?? now
+        let end = cal.date(byAdding: .month, value: 1, to: thisMonthStart) ?? now
+        let start = cal.date(byAdding: .month, value: -11, to: thisMonthStart) ?? thisMonthStart
+        self.startDate = start
+        self.endDate = end
+        _days = Query(
+            filter: #Predicate<DailySummary> { $0.date >= start && $0.date < end && $0.hrvSampleCount > 0 },
+            sort: \.date
+        )
+    }
+
+    private var points: [HealthPoint] {
+        let cal = Calendar.current
+        var byMonth: [Date: Int] = [:]
+        for d in days {
+            let comps = cal.dateComponents([.year, .month], from: d.date)
+            guard let monthStart = cal.date(from: comps) else { continue }
+            byMonth[monthStart, default: 0] += d.hrvSampleCount
+        }
+        return byMonth.map { HealthPoint(date: $0.key, value: Double($0.value)) }
+            .sorted { $0.date < $1.date }
+    }
+
+    private var sampleCount: Int { days.reduce(0) { $0 + $1.hrvSampleCount } }
+
+    private var dateRangeText: String {
+        let lastMonth = Calendar.current.date(byAdding: .month, value: -1, to: endDate) ?? endDate
+        return "\(startDate.formatted(.dateTime.month(.abbreviated).year())) – \(lastMonth.formatted(.dateTime.month(.abbreviated).year()))"
+    }
+
+    var body: some View {
+        HealthChartContainer(
+            headerLabel: "SAMPLES",
+            avgText: sampleCount.formatted(),
+            unitLabel: "",
+            dateRangeText: dateRangeText,
+            points: points,
+            xDomain: startDate...endDate,
+            xStride: HealthXStride(component: .month, count: 3),
+            xFormat: .dateTime.month(.abbreviated),
+            tooltipDateFormat: .dateTime.month(.wide).year(),
+            tint: .purple,
+            yStep: 10
+        )
+    }
+}
+
+private struct HRVDayRow: View {
+    let dayStart: Date
+    @Query private var samples: [HRVSample]
+
+    init(dayStart: Date) {
+        self.dayStart = dayStart
+        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        _samples = Query(
+            filter: #Predicate<HRVSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
+            sort: \.timestamp
+        )
+    }
+
+    var body: some View {
+        let values = samples.map(\.rmssdMS)
+        let low = Int((values.min() ?? 0).rounded())
+        let high = Int((values.max() ?? 0).rounded())
+        HealthDaySummaryRow(low: low, high: high, unit: "ms", date: dayStart)
+    }
+}
+
+// MARK: - Per-day HRV samples
+
+struct DayHRVSamplesView: View {
+    let dayStart: Date
+    @Query private var samples: [HRVSample]
+
+    init(dayStart: Date) {
+        self.dayStart = dayStart
+        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        _samples = Query(
+            filter: #Predicate<HRVSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
+            sort: \.timestamp,
+            order: .reverse
+        )
+    }
+
+    var body: some View {
+        List {
+            if samples.isEmpty {
+                Section {
+                    Text("No samples recorded.")
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Section {
+                    ForEach(samples) { sample in
+                        HealthSampleRow(
+                            value: Int(sample.rmssdMS.rounded()),
+                            unit: "ms",
+                            date: sample.timestamp
+                        )
+                    }
+                }
+            }
+        }
+        .navigationTitle(dayStart.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
         .navigationBarTitleDisplayMode(.inline)
     }
 }

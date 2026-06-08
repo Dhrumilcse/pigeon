@@ -79,7 +79,7 @@ struct HealthChartContainer: View {
 
     private var displayValueText: String {
         guard let sp = selectedPoint else { return avgText }
-        return "\(Int(sp.value.rounded()))"
+        return Int(sp.value.rounded()).formatted()
     }
 
     private var displayDateText: String {
@@ -163,4 +163,187 @@ struct HealthChartContainer: View {
         .frame(height: 280)
     }
 
+}
+
+// MARK: - Options section (Apple Health–style)
+
+struct HealthOptionsSection<ShowAll: View, UnitPicker: View>: View {
+    let unitText: String
+    @ViewBuilder var showAllData: () -> ShowAll
+    @ViewBuilder var unitPicker: () -> UnitPicker
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("OPTIONS")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.secondary)
+                .tracking(0.5)
+                .padding(.leading, 4)
+
+            VStack(spacing: 0) {
+                NavigationLink {
+                    showAllData()
+                } label: {
+                    HealthOptionsRow(title: "Show All Data", value: nil)
+                }
+                .buttonStyle(.plain)
+
+                Divider().padding(.leading, 16)
+
+                NavigationLink {
+                    unitPicker()
+                } label: {
+                    HealthOptionsRow(title: "Unit", value: unitText)
+                }
+                .buttonStyle(.plain)
+            }
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color(.secondarySystemGroupedBackground))
+            )
+        }
+    }
+}
+
+private struct HealthOptionsRow: View {
+    let title: String
+    let value: String?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(title)
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+            Spacer()
+            if let value {
+                Text(value)
+                    .font(.system(size: 17))
+                    .foregroundColor(.secondary)
+            }
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.secondary.opacity(0.6))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .contentShape(Rectangle())
+    }
+}
+
+// A simple Unit picker page with a single selected option. Mirrors Apple
+// Health for symmetry — the underlying metric only has one canonical unit
+// (BPM for HR, ms for HRV), so this is informational.
+struct HealthUnitPickerView: View {
+    let title: String
+    let unit: String
+
+    var body: some View {
+        List {
+            Section {
+                HStack {
+                    Text(unit)
+                    Spacer()
+                    Image(systemName: "checkmark")
+                        .foregroundColor(.accentColor)
+                }
+            }
+        }
+        .navigationTitle(title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - Show-all-data day row
+
+// A row in the "Show All Data" list, formatted like Apple Health:
+// "<low>–<high>" on the left, date on the right.
+struct HealthDaySummaryRow: View {
+    let low: Int
+    let high: Int
+    let unit: String
+    let date: Date
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("\(low)–\(high)")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundColor(.primary)
+                Text(unit)
+                    .font(.system(size: 15))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Text(date.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year()))
+                .font(.system(size: 15))
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+// Rounded-card list of day rows. Mirrors the visual of an inset-grouped
+// List section, but lives inside a ScrollView so the page header can sit
+// flush against the nav bar (a real List adds ~80pt of grouped-style
+// padding above the first section, which doesn't match the detail view).
+struct HealthDayList<Day: Identifiable, RowContent: View>: View {
+    let days: [Day]
+    @ViewBuilder var row: (Day) -> RowContent
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(days.enumerated()), id: \.element.id) { idx, day in
+                row(day)
+                if idx < days.count - 1 {
+                    Divider().padding(.leading, 16)
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+    }
+}
+
+// Wraps a HealthDaySummaryRow (or similar) with the standard navigation
+// row chrome: 16pt horizontal padding, 14pt vertical padding, trailing
+// chevron, and a tappable rectangle for the hit area.
+struct HealthDayLinkRow<Content: View>: View {
+    @ViewBuilder var content: () -> Content
+
+    var body: some View {
+        HStack(spacing: 8) {
+            content()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(.secondary.opacity(0.6))
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 14)
+        .contentShape(Rectangle())
+    }
+}
+
+// Row for an individual sample inside a single day.
+struct HealthSampleRow: View {
+    let value: Int
+    let unit: String
+    let date: Date
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("\(value)")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundColor(.primary)
+                Text(unit)
+                    .font(.system(size: 15))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Text(date.formatted(.dateTime.hour().minute()))
+                .font(.system(size: 15))
+                .foregroundColor(.secondary)
+        }
+    }
 }
