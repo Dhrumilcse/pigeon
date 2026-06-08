@@ -53,7 +53,6 @@ struct HealthChartContainer: View {
     let xStride: HealthXStride
     let xFormat: Date.FormatStyle
     let tooltipDateFormat: Date.FormatStyle
-    let tooltipLabel: String
     let tint: Color
     let yStep: Double
 
@@ -73,11 +72,20 @@ struct HealthChartContainer: View {
         })
     }
 
+    private var displayValueText: String {
+        guard let sp = selectedPoint else { return avgText }
+        return "\(Int(sp.value.rounded()))"
+    }
+
+    private var displayDateText: String {
+        guard let sp = selectedPoint else { return dateRangeText }
+        return sp.date.formatted(tooltipDateFormat)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             header
             chart
-            trendRow
         }
     }
 
@@ -88,13 +96,13 @@ struct HealthChartContainer: View {
                 .foregroundColor(.secondary)
                 .tracking(0.5)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(avgText)
+                Text(displayValueText)
                     .font(.system(size: 36, weight: .bold))
                 Text(unitLabel)
                     .font(.system(size: 18))
                     .foregroundColor(.secondary)
             }
-            Text(dateRangeText)
+            Text(displayDateText)
                 .font(.system(size: 14))
                 .foregroundColor(.secondary)
         }
@@ -123,13 +131,6 @@ struct HealthChartContainer: View {
                 RuleMark(x: .value("Selected", sp.date))
                     .foregroundStyle(Color.secondary.opacity(0.5))
                     .lineStyle(StrokeStyle(lineWidth: 1))
-                    .annotation(
-                        position: .top,
-                        spacing: 8,
-                        overflowResolution: .init(x: .fit(to: .chart), y: .disabled)
-                    ) {
-                        tooltip(for: sp)
-                    }
 
                 PointMark(
                     x: .value("Selected", sp.date),
@@ -157,47 +158,4 @@ struct HealthChartContainer: View {
         .frame(height: 280)
     }
 
-    private func tooltip(for p: HealthPoint) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(tooltipLabel)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundColor(.secondary)
-                .tracking(0.5)
-            HStack(alignment: .firstTextBaseline, spacing: 3) {
-                Text("\(Int(p.value.rounded()))")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundColor(.primary)
-                Text(unitLabel)
-                    .font(.system(size: 13))
-                    .foregroundColor(.secondary)
-            }
-            Text(p.date.formatted(tooltipDateFormat))
-                .font(.system(size: 12))
-                .foregroundColor(.secondary)
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(Color(.systemGray5))
-        )
-    }
-
-    private var trendRow: some View {
-        HStack {
-            Text("Trend")
-                .font(.system(size: 17))
-                .foregroundColor(.primary)
-            Spacer()
-            Text("None")
-                .font(.system(size: 17))
-                .foregroundColor(.secondary)
-        }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(.systemGray6))
-        )
-    }
 }

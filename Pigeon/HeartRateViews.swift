@@ -171,7 +171,6 @@ private struct HourlyHRChartBody: View {
             xStride: HealthXStride(component: .hour, count: 6),
             xFormat: .dateTime.hour(),
             tooltipDateFormat: .dateTime.hour().minute(),
-            tooltipLabel: "HEART RATE",
             tint: .red,
             yStep: 10
         )
@@ -229,7 +228,6 @@ private struct DailyHRChartBody: View {
             xStride: xStride,
             xFormat: xFormat,
             tooltipDateFormat: .dateTime.month(.abbreviated).day().year(),
-            tooltipLabel: "HEART RATE",
             tint: .red,
             yStep: 10
         )
@@ -302,7 +300,6 @@ private struct MonthlyHRChartBody: View {
             xStride: HealthXStride(component: .month, count: 3),
             xFormat: .dateTime.month(.abbreviated),
             tooltipDateFormat: .dateTime.month(.wide).year(),
-            tooltipLabel: "HEART RATE",
             tint: .red,
             yStep: 10
         )
