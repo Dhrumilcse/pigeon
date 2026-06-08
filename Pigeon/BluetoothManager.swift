@@ -33,6 +33,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var commandCharacteristic: CBCharacteristic?
     private var isAuthenticated = false
     private var hasAttemptedAutoReconnect = false
+    private var userInitiatedDisconnect = false
 
     // V5 frame reassembly state, keyed by characteristic. iOS notifications are
     // MTU-capped (~244 B), so long frames like the K21 raw-motion stream arrive
@@ -180,6 +181,7 @@ class BluetoothManager: NSObject, ObservableObject {
     }
 
     func disconnect() {
+        userInitiatedDisconnect = true
         if let peripheral = connectedPeripheral {
             centralManager.cancelPeripheralConnection(peripheral)
         }
@@ -453,9 +455,6 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        connectionState = .disconnected
-        connectedDevice = nil
-        connectedPeripheral = nil
         isAuthenticated = false
         commandCharacteristic = nil
 
@@ -476,6 +475,24 @@ extension BluetoothManager: CBCentralManagerDelegate {
         lastRealtimeHRNudgeAt = nil
 
         v5Reassembly.removeAll()
+
+        if userInitiatedDisconnect {
+            userInitiatedDisconnect = false
+            connectionState = .disconnected
+            connectedDevice = nil
+            connectedPeripheral = nil
+            return
+        }
+
+        // Unexpected drop. CoreBluetooth holds the connect request until the
+        // peripheral is reachable again, so no retry loop is needed here.
+        if let error = error {
+            logWarn("Unexpected disconnect: \(error.localizedDescription), reconnecting", tag: "BLE")
+        } else {
+            logWarn("Unexpected disconnect, reconnecting", tag: "BLE")
+        }
+        connectionState = .connecting
+        central.connect(peripheral, options: nil)
     }
 }
 
