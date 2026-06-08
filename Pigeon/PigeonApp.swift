@@ -1,10 +1,23 @@
 import SwiftUI
+import SwiftData
 
 @main
 struct PigeonApp: App {
+    let modelContainer: ModelContainer
+
+    init() {
+        do {
+            modelContainer = try ModelContainer(for: HRSample.self, RRSample.self, HRVSample.self,
+                                                    DailySummary.self, MonthlySummary.self)
+        } catch {
+            fatalError("Failed to create ModelContainer: \(error)")
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(modelContainer: modelContainer)
         }
+        .modelContainer(modelContainer)
     }
 }
