@@ -29,5 +29,9 @@
 	<string>Pigeon needs Bluetooth to connect to your WHOOP device and read health data.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>
 	<string>Pigeon needs Bluetooth to connect to your WHOOP device and read health data.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+	</array>
 </dict>
 </plist>

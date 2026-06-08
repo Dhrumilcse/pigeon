@@ -1,8 +1,12 @@
 import SwiftUI
-import CoreBluetooth
+import SwiftData
 
 struct ContentView: View {
-    @StateObject private var bluetooth = BluetoothManager()
+    @StateObject private var bluetooth: BluetoothManager
+
+    init(modelContainer: ModelContainer) {
+        _bluetooth = StateObject(wrappedValue: BluetoothManager(modelContainer: modelContainer))
+    }
 
     var body: some View {
         TabView {

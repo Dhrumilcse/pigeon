@@ -1,24 +1,19 @@
 import CoreBluetooth
 import Foundation
 import Combine
+import SwiftData
 
 class BluetoothManager: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var discoveredDevices: [DiscoveredDevice] = []
     @Published var connectionState: ConnectionState = .disconnected
     @Published var connectedDevice: DiscoveredDevice?
-    @Published var receivedPackets: [PacketData] = []
     @Published var bluetoothState: CBManagerState = .unknown
     @Published var currentHeartRate: Int?
     @Published var lastHeartRateUpdate: Date?
-    @Published var lastRRIntervalsMS: [Double] = []
     @Published var lastRRReceivedAt: Date?
     @Published var currentHRV: Double?
     @Published var lastHRVUpdate: Date?
-    @Published var currentSkinTemp: Double?
-    @Published var lastSkinTempUpdate: Date?
-    @Published var currentSpO2: Int?
-    @Published var lastSpO2Update: Date?
     @Published var debugLog: [DebugLogEntry] = []
 
     // Standard public-service info (read from 0x180A / 0x180F)
@@ -38,6 +33,21 @@ class BluetoothManager: NSObject, ObservableObject {
     private var commandCharacteristic: CBCharacteristic?
     private var isAuthenticated = false
     private var hasAttemptedAutoReconnect = false
+
+    // V5 frame reassembly state, keyed by characteristic. iOS notifications are
+    // MTU-capped (~244 B), so long frames like the K21 raw-motion stream arrive
+    // in several pieces and have to be stitched back together before parsing.
+    private struct V5ReassemblyState {
+        var bytes: [UInt8] = []
+        var declaredTotal: Int = 0
+        var chunkCount: Int = 0
+    }
+    private var v5Reassembly: [CBUUID: V5ReassemblyState] = [:]
+
+    private struct V5CompleteFrame {
+        let bytes: Data
+        let chunkCount: Int
+    }
 
     private static let rememberedDeviceKey = "pigeon.rememberedDeviceID"
 
@@ -61,6 +71,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private let systemIDUUID = CBUUID(string: "2A23")
     private let pnpIDUUID = CBUUID(string: "2A50")
     private let batteryLevelUUID = CBUUID(string: "2A19")
+    private let heartRateMeasurementUUID = CBUUID(string: "2A37")
     private let notificationCharacteristicUUIDs = [
         CBUUID(string: "fd4b0003-cce1-4033-93ce-002d5875f58a"),
         CBUUID(string: "fd4b0004-cce1-4033-93ce-002d5875f58a"),
@@ -76,12 +87,13 @@ class BluetoothManager: NSObject, ObservableObject {
 
     private var nextSequence: UInt8 = 2
 
-    // Rolling RR-interval window for RMSSD HRV computation.
-    private struct RRSample {
+    // Rolling RR-interval window for RMSSD HRV computation. Distinct from the
+    // SwiftData @Model `RRSample` — this is the in-memory cache the math uses.
+    private struct RRWindowEntry {
         let timestamp: Date
         let intervalMS: Double
     }
-    private var rrWindow: [RRSample] = []
+    private var rrWindow: [RRWindowEntry] = []
     private static let hrvWindowSeconds: TimeInterval = 60
     private static let hrvMinSamples = 5
     private static let rrIntervalMinMS: Double = 300   // 200 bpm — reject anything tighter as an artifact
@@ -102,9 +114,26 @@ class BluetoothManager: NSObject, ObservableObject {
         [whoopServiceGen5, whoopServiceGen4]
     }
 
-    override init() {
+    // SwiftData persistence. We own a non-MainActor context backed by the
+    // same container the views read from — safe because every BLE callback
+    // hits us on `.main` (the queue we hand to CBCentralManager), so the
+    // context is only ever used from one thread.
+    private let modelContainer: ModelContainer
+    private let modelContext: ModelContext
+
+    // State-restoration identifier. iOS uses this to wake us up in the background
+    // when the connected peripheral sends data, even if the app was force-quit.
+    private static let centralRestoreIdentifier = "pigeon.central"
+
+    init(modelContainer: ModelContainer) {
+        self.modelContainer = modelContainer
+        self.modelContext = ModelContext(modelContainer)
         super.init()
-        centralManager = CBCentralManager(delegate: self, queue: .main)
+        centralManager = CBCentralManager(
+            delegate: self,
+            queue: .main,
+            options: [CBCentralManagerOptionRestoreIdentifierKey: Self.centralRestoreIdentifier]
+        )
     }
 
     func startScanning() {
@@ -169,15 +198,15 @@ class BluetoothManager: NSObject, ObservableObject {
         writeCommand(frame, to: peripheral, characteristic: characteristic)
     }
 
-    // R10/R11 Realtime On: command 63 with payload [1] (Goose: SEND_R10_R11_REALTIME_ON).
-    // Goose pairs this with TOGGLE_REALTIME_HR_ON; it appears to unlock richer
-    // beat-to-beat data, including RR intervals, on the realtime stream.
-    private func sendR10R11RealtimeOn(to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
+    // Exit High Frequency History Sync: command 97 with empty payload
+    // (Goose: EXIT_HIGH_FREQ_SYNC). Tells the strap to stop dumping historical
+    // K18/K20/K21 packets so realtime HR/RR have the airtime to flow cleanly.
+    private func sendExitHighFreqSync(to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
         let seq = nextSequence
         nextSequence &+= 1
-        let frame = Self.buildV5CommandFrame(sequence: seq, command: 63, data: [1])
+        let frame = Self.buildV5CommandFrame(sequence: seq, command: 97, data: [])
         let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
-        logTX("SEND_R10_R11_REALTIME_ON seq=\(seq)", tag: "CMD", hex: hexStr)
+        logTX("EXIT_HIGH_FREQ_SYNC seq=\(seq)", tag: "CMD", hex: hexStr)
         writeCommand(frame, to: peripheral, characteristic: characteristic)
     }
 
@@ -253,6 +282,27 @@ class BluetoothManager: NSObject, ObservableObject {
         return ~crc
     }
 
+    func sendSetAdvertisingName(_ name: String, completion: ((Bool) -> Void)? = nil) {
+        guard isAuthenticated,
+              let peripheral = connectedPeripheral,
+              let cmd = commandCharacteristic else {
+            logError("Cannot rename — not authenticated", tag: "CMD")
+            completion?(false)
+            return
+        }
+        let nameBytes = Array(name.utf8)
+        guard !nameBytes.isEmpty else { return }
+        let seq = nextSequence
+        nextSequence &+= 1
+        let frame = Self.buildV5CommandFrame(sequence: seq, command: 140, data: nameBytes)
+        let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
+        logTX("SET_ADVERTISING_NAME \"\(name)\" seq=\(seq)", tag: "CMD", hex: hexStr)
+        pendingRenameCompletion = completion
+        writeCommand(frame, to: peripheral, characteristic: cmd)
+    }
+
+    private var pendingRenameCompletion: ((Bool) -> Void)?
+
     private func sendClientHello(to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
         let data = Data(clientHelloFrame)
         let hexStr = data.map { String(format: "%02x", $0) }.joined(separator: " ")
@@ -270,6 +320,37 @@ class BluetoothManager: NSObject, ObservableObject {
 
 // MARK: - CBCentralManagerDelegate
 extension BluetoothManager: CBCentralManagerDelegate {
+    // Called by iOS before `centralManagerDidUpdateState` when the system
+    // relaunches the app to deliver BLE events. We re-attach our delegate
+    // to any peripherals iOS handed back and resume bookkeeping; everything
+    // else (auth, characteristic discovery) flows through the same delegate
+    // methods as a fresh connection.
+    func centralManager(_ central: CBCentralManager, willRestoreState dict: [String : Any]) {
+        guard let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] else {
+            logInfo("State restored with no peripherals", tag: "BLE")
+            return
+        }
+        logInfo("State restored with \(peripherals.count) peripheral(s)", tag: "BLE")
+
+        for peripheral in peripherals {
+            peripheral.delegate = self
+            deviceMap[peripheral.identifier] = peripheral
+
+            if peripheral.state == .connected {
+                connectedPeripheral = peripheral
+                connectionState = .connected
+                connectedDevice = DiscoveredDevice(
+                    id: peripheral.identifier,
+                    name: peripheral.name ?? "WHOOP",
+                    rssi: nil
+                )
+                // Kick characteristic discovery to re-wire commandCharacteristic
+                // and trigger CLIENT_HELLO; idempotent if iOS preserved services.
+                peripheral.discoverServices(nil)
+            }
+        }
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         bluetoothState = central.state
 
@@ -390,9 +471,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
         rrWindow.removeAll()
         currentHRV = nil
         lastHRVUpdate = nil
-        lastRRIntervalsMS = []
         lastRRReceivedAt = nil
         lastRealtimeHRNudgeAt = nil
+
+        v5Reassembly.removeAll()
     }
 }
 
@@ -428,6 +510,13 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
 
         for characteristic in characteristics {
+            // Skip the public Heart Rate Measurement (0x2A37). We get the same
+            // HR + RR from the custom WHOOP K2 stream; ingesting both channels
+            // doubles RR samples into the HRV window and biases the math.
+            if characteristic.uuid == heartRateMeasurementUUID {
+                continue
+            }
+
             // Check if this is the command characteristic
             if characteristic.uuid == commandCharacteristicUUID {
                 logOK("Found WHOOP command characteristic", tag: "BLE")
@@ -469,112 +558,154 @@ extension BluetoothManager: CBPeripheralDelegate {
             return
         }
 
-        // Log full hex dump for analysis
-        let hexString = data.map { String(format: "%02x", $0) }.joined(separator: " ")
-        let packetTypeHex = data.count > 0 ? String(format: "%02x", data[0]) : "empty"
-
-        // Short tag for the source characteristic (e.g. "0003", "0005").
-        let uuidStr = characteristic.uuid.uuidString.lowercased()
-        let shortUUID: String = {
-            if characteristic.uuid == commandCharacteristicUUID { return "0002" }
-            if characteristic.uuid == responseCharacteristicUUID { return "0003" }
-            if characteristic.uuid == dataCharacteristicUUID { return "0005" }
-            return String(uuidStr.prefix(8))
-        }()
-
-        logRX("type=\(packetTypeHex) len=\(data.count)", tag: shortUUID, hex: hexString)
-
-        // Standard public-service characteristics (0x180A device info, 0x180F battery).
+        // 1. Standard public-service characteristics short-circuit (info, battery).
+        //    They self-log via logInfo from inside the handler.
         if handleStandardCharacteristic(characteristic, data: data) {
             return
         }
 
-        // Check if this is a response to CLIENT_HELLO
-        // Expected response: aa 01 0c 00 00 01 e7 41 24 09 91 01 ...
-        // Command 0x91 should be at byte index 10
-        if !isAuthenticated && data.count > 10 {
-            // Check for frame start (aa 01) and command 0x91
-            if data[0] == 0xaa && data[1] == 0x01 && data[10] == 0x91 {
-                logOK("Authenticated", tag: "AUTH")
-                isAuthenticated = true
+        // 2. Custom WHOOP characteristics (fd4b…): run V5 reassembly. iOS BLE
+        //    notifications are MTU-capped, so long frames (K21 raw motion is
+        //    1244+ bytes) arrive in several chunks and need stitching.
+        if isCustomWhoopCharacteristic(characteristic) {
+            guard let complete = processV5Chunk(data, characteristic: characteristic) else {
+                return // still accumulating, or chunk wasn't a valid V5 start
+            }
+            handleCompleteV5Frame(complete, characteristic: characteristic, peripheral: peripheral)
+            return
+        }
 
-                // Kick off realtime HR after auth, then R10/R11 a beat later
-                // (Goose pairs the two; cmd 63 may be required for RR intervals).
-                if let cmd = commandCharacteristic {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                        self?.sendRealtimeHROn(to: peripheral, characteristic: cmd)
-                    }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
-                        self?.sendR10R11RealtimeOn(to: peripheral, characteristic: cmd)
-                    }
-                } else {
-                    logError("No command characteristic to send realtime commands", tag: "CMD")
-                }
+        // Anything else (e.g. an unexpected notification on a char we didn't
+        // intentionally subscribe to) is intentionally ignored.
+    }
+
+    // MARK: V5 reassembly + dispatch
+
+    private func isCustomWhoopCharacteristic(_ characteristic: CBCharacteristic) -> Bool {
+        characteristic.uuid.uuidString.lowercased().hasPrefix("fd4b")
+    }
+
+    private func shortTag(_ uuid: CBUUID) -> String {
+        if uuid == commandCharacteristicUUID { return "0002" }
+        if uuid == responseCharacteristicUUID { return "0003" }
+        if uuid == dataCharacteristicUUID { return "0005" }
+        return String(uuid.uuidString.lowercased().prefix(8))
+    }
+
+    private func processV5Chunk(_ data: Data, characteristic: CBCharacteristic) -> V5CompleteFrame? {
+        let uuid = characteristic.uuid
+        var state = v5Reassembly[uuid] ?? V5ReassemblyState()
+
+        if state.bytes.isEmpty {
+            // Expecting the start of a new frame: must begin with aa 01.
+            guard data.count >= 8, data[0] == 0xaa, data[1] == 0x01 else {
+                logWarn("Non-V5 chunk dropped (\(data.count) B)", tag: shortTag(uuid))
+                return nil
+            }
+            let declaredLength = Int(UInt16(data[2]) | UInt16(data[3]) << 8)
+            state.declaredTotal = declaredLength + 8
+            state.chunkCount = 0
+        }
+
+        state.bytes.append(contentsOf: data)
+        state.chunkCount += 1
+
+        if state.bytes.count >= state.declaredTotal {
+            let frame = Data(state.bytes.prefix(state.declaredTotal))
+            let chunks = state.chunkCount
+            v5Reassembly[uuid] = V5ReassemblyState()
+            return V5CompleteFrame(bytes: frame, chunkCount: chunks)
+        }
+
+        v5Reassembly[uuid] = state
+        return nil
+    }
+
+    // Focused dispatcher: we care about K2 (HR + RR) and command responses (acks).
+    // Everything else the strap emits — historical sync, raw IMU, metadata, console
+    // logs — is silently dropped so the log stays useful.
+    private func handleCompleteV5Frame(_ complete: V5CompleteFrame, characteristic: CBCharacteristic, peripheral: CBPeripheral) {
+        let frame = complete.bytes
+        let payload = Array(frame[8..<(frame.count - 4)])
+        guard let packetType = payload.first else { return }
+
+        switch packetType {
+        case 0x24:
+            handleCommandResponse(payload: payload, peripheral: peripheral)
+        case 0x28:
+            handleRealtimeHR(frame: frame, peripheral: peripheral)
+        default:
+            break // silently dropped — not subscribed to anything else right now
+        }
+    }
+
+    private func handleCommandResponse(payload: [UInt8], peripheral: CBPeripheral) {
+        guard payload.count >= 5 else { return }
+        let respondedCmd = payload[2]
+        let originSeq = payload[3]
+        let resultCode = payload[4]
+
+        // CLIENT_HELLO ack → flip auth, fire realtime command sequence.
+        if !isAuthenticated, respondedCmd == 0x91 {
+            logOK("Authenticated", tag: "AUTH")
+            isAuthenticated = true
+            guard let cmd = commandCharacteristic else {
+                logError("No command characteristic to send realtime commands", tag: "CMD")
                 return
             }
-        }
-
-        let packet = PacketData(
-            timestamp: Date(),
-            characteristicUUID: characteristic.uuid.uuidString,
-            data: data
-        )
-
-        receivedPackets.append(packet)
-
-        // Keep only last 100 packets
-        if receivedPackets.count > 100 {
-            receivedPackets.removeFirst()
-        }
-
-        // V5-framed packets (start with aa 01) carry WHOOP's custom payloads.
-        // Try the structured parser first; if matched, skip the heuristic scanner
-        // (which would otherwise read the SOF byte 0xaa as HR=170).
-        if data.count >= 2 && data[0] == 0xaa && data[1] == 0x01 {
-            if let v5 = Self.parseV5RealtimeData(data) {
-                let rrSummary = v5.rrIntervalsMS.isEmpty
-                    ? "—"
-                    : v5.rrIntervalsMS.map { String(format: "%.0f", $0) }.joined(separator: ",") + "ms"
-                logOK("K\(v5.k) seq=\(v5.sequence) HR=\(v5.hr) RR=[\(rrSummary)]", tag: "HR")
-
-                if v5.hr >= 30 && v5.hr <= 220 {
-                    currentHeartRate = v5.hr
-                    lastHeartRateUpdate = Date()
-                }
-                if !v5.rrIntervalsMS.isEmpty {
-                    lastRRIntervalsMS = v5.rrIntervalsMS
-                    lastRRReceivedAt = Date()
-                    ingestRRIntervals(v5.rrIntervalsMS)
-                } else {
-                    maybeNudgeRealtimeHR(on: peripheral)
-                }
+            // Order matters: stop the historical firehose first, then enable HR.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.sendExitHighFreqSync(to: peripheral, characteristic: cmd)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+                self?.sendRealtimeHROn(to: peripheral, characteristic: cmd)
             }
             return
         }
 
-        // Legacy heuristic parse for non-V5 characteristics (e.g. standard 0x2A37 HR).
-        if let heartRate = PacketParser.extractHeartRate(data) {
-            logOK("HR=\(heartRate) bpm", tag: "HR")
-            currentHeartRate = heartRate
+        // SET_ADVERTISING_NAME ack (command 140 = 0x8C)
+        if respondedCmd == 140 {
+            let success = resultCode == 1
+            logOK("SET_ADVERTISING_NAME → \(Self.commandResultName(resultCode))", tag: "CMD")
+            let cb = pendingRenameCompletion
+            pendingRenameCompletion = nil
+            cb?(success)
+            return
+        }
+
+        // Any other ack: just record the outcome so debug shows command health.
+        let resultName = Self.commandResultName(resultCode)
+        logOK("ack cmd=0x\(String(format: "%02x", respondedCmd)) seq=\(originSeq) → \(resultName)", tag: "CMD")
+    }
+
+    private func handleRealtimeHR(frame: Data, peripheral: CBPeripheral) {
+        guard let v5 = Self.parseV5RealtimeData(frame) else { return }
+
+        let rrSummary = v5.rrIntervalsMS.isEmpty
+            ? "—"
+            : v5.rrIntervalsMS.map { String(format: "%.0f", $0) }.joined(separator: ",") + "ms"
+        logOK("K\(v5.k) seq=\(v5.sequence) HR=\(v5.hr) RR=[\(rrSummary)]", tag: "HR")
+
+        if (30...220).contains(v5.hr) {
+            currentHeartRate = v5.hr
             lastHeartRateUpdate = Date()
+            persistHeartRateSample(v5.hr)
         }
-
-        if let hrv = PacketParser.extractHRV(data) {
-            logOK("HRV=\(String(format: "%.1f", hrv)) ms", tag: "HRV")
-            currentHRV = hrv
-            lastHRVUpdate = Date()
+        if v5.rrIntervalsMS.isEmpty {
+            maybeNudgeRealtimeHR(on: peripheral)
+        } else {
+            lastRRReceivedAt = Date()
+            ingestRRIntervals(v5.rrIntervalsMS)
         }
+    }
 
-        if let skinTemp = PacketParser.extractSkinTemp(data) {
-            logOK("Temp=\(String(format: "%.1f", skinTemp))°C", tag: "TEMP")
-            currentSkinTemp = skinTemp
-            lastSkinTempUpdate = Date()
-        }
-
-        if let spo2 = PacketParser.extractSpO2(data) {
-            logOK("SpO2=\(spo2)%", tag: "SPO2")
-            currentSpO2 = spo2
-            lastSpO2Update = Date()
+    private static func commandResultName(_ code: UInt8) -> String {
+        switch code {
+        case 0: return "FAILURE"
+        case 1: return "SUCCESS"
+        case 2: return "PENDING"
+        case 3: return "UNSUPPORTED"
+        default: return "RESULT_\(code)"
         }
     }
 
@@ -626,6 +757,86 @@ extension BluetoothManager: CBPeripheralDelegate {
         return V5RealtimeData(k: k, sequence: sequence, hr: hr, rrIntervalsMS: rr, bodyHex: bodyHex)
     }
 
+    // Persist one HR sample to SwiftData. The main context autosaves, so we
+    // just insert; we don't `save()` per-call. Retention is "forever" — no
+    // trimming. If storage ever feels heavy, switch to hourly roll-ups for
+    // data older than ~30 days.
+    private func persistHeartRateSample(_ bpm: Int) {
+        modelContext.insert(HRSample(timestamp: Date(), bpm: bpm))
+        updateDailySummary(bpm: bpm)
+    }
+
+    // MARK: - Summary aggregation
+
+    private func updateDailySummary(bpm: Int) {
+        let today = Calendar.current.startOfDay(for: Date())
+        let summary = fetchOrCreateDailySummary(for: today)
+        if summary.hrSampleCount == 0 {
+            summary.minHR = bpm
+            summary.maxHR = bpm
+        } else {
+            summary.minHR = min(summary.minHR, bpm)
+            summary.maxHR = max(summary.maxHR, bpm)
+        }
+        summary.sumHR += Double(bpm)
+        summary.hrSampleCount += 1
+        rebuildMonthlySummary(for: today)
+    }
+
+    private func updateDailySummaryHRV(_ rmssd: Double) {
+        let today = Calendar.current.startOfDay(for: Date())
+        let summary = fetchOrCreateDailySummary(for: today)
+        summary.sumHRV += rmssd
+        summary.hrvSampleCount += 1
+        rebuildMonthlySummary(for: today)
+    }
+
+    private func fetchOrCreateDailySummary(for startOfDay: Date) -> DailySummary {
+        let descriptor = FetchDescriptor<DailySummary>(
+            predicate: #Predicate { $0.date == startOfDay }
+        )
+        if let existing = (try? modelContext.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = DailySummary(date: startOfDay)
+        modelContext.insert(summary)
+        return summary
+    }
+
+    private func rebuildMonthlySummary(for day: Date) {
+        let calendar = Calendar.current
+        let comps = calendar.dateComponents([.year, .month], from: day)
+        guard let firstOfMonth = calendar.date(from: comps),
+              let nextMonth = calendar.date(byAdding: .month, value: 1, to: firstOfMonth)
+        else { return }
+
+        let dailyDescriptor = FetchDescriptor<DailySummary>(
+            predicate: #Predicate { $0.date >= firstOfMonth && $0.date < nextMonth }
+        )
+        guard let dailies = try? modelContext.fetch(dailyDescriptor), !dailies.isEmpty else { return }
+
+        let monthDescriptor = FetchDescriptor<MonthlySummary>(
+            predicate: #Predicate { $0.yearMonth == firstOfMonth }
+        )
+        let monthly: MonthlySummary
+        if let existing = (try? modelContext.fetch(monthDescriptor))?.first {
+            monthly = existing
+        } else {
+            monthly = MonthlySummary(yearMonth: firstOfMonth)
+            modelContext.insert(monthly)
+        }
+
+        let withHR = dailies.filter { $0.hrSampleCount > 0 }
+        monthly.dayCount = withHR.count
+        monthly.avgHR = withHR.isEmpty ? 0 : withHR.map(\.avgHR).reduce(0, +) / Double(withHR.count)
+        monthly.minHR = withHR.map(\.minHR).min() ?? 0
+        monthly.maxHR = withHR.map(\.maxHR).max() ?? 0
+
+        let withHRV = dailies.filter { $0.hrvSampleCount > 0 }
+        monthly.daysWithHRV = withHRV.count
+        monthly.avgHRV = withHRV.isEmpty ? 0 : withHRV.compactMap(\.avgHRV).reduce(0, +) / Double(withHRV.count)
+    }
+
     // Adds new RR intervals to a 60-second rolling window and republishes
     // currentHRV as the RMSSD (Root Mean Square of Successive Differences)
     // over the window. Outlier RR values (likely missed or doubled beats)
@@ -635,7 +846,9 @@ extension BluetoothManager: CBPeripheralDelegate {
 
         for ms in intervals {
             guard ms >= Self.rrIntervalMinMS, ms <= Self.rrIntervalMaxMS else { continue }
-            rrWindow.append(RRSample(timestamp: now, intervalMS: ms))
+            rrWindow.append(RRWindowEntry(timestamp: now, intervalMS: ms))
+            // Persist the raw R-R interval — sparse and cheap.
+            modelContext.insert(RRSample(timestamp: now, intervalMS: ms))
         }
 
         let cutoff = now.addingTimeInterval(-Self.hrvWindowSeconds)
@@ -665,6 +878,8 @@ extension BluetoothManager: CBPeripheralDelegate {
         let rmssd = (sumSquaredDiffs / Double(validDiffs)).squareRoot()
         currentHRV = rmssd
         lastHRVUpdate = now
+        modelContext.insert(HRVSample(timestamp: now, rmssdMS: rmssd))
+        updateDailySummaryHRV(rmssd)
         let skippedTag = skippedDiffs > 0 ? " skipped=\(skippedDiffs)" : ""
         logOK("RMSSD=\(String(format: "%.1f", rmssd))ms n=\(rrWindow.count)\(skippedTag)", tag: "HRV")
     }
@@ -746,12 +961,7 @@ extension BluetoothManager: CBPeripheralDelegate {
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        let tag: String = {
-            if characteristic.uuid == commandCharacteristicUUID { return "0002" }
-            if characteristic.uuid == responseCharacteristicUUID { return "0003" }
-            if characteristic.uuid == dataCharacteristicUUID { return "0005" }
-            return String(characteristic.uuid.uuidString.lowercased().prefix(8))
-        }()
+        let tag = shortTag(characteristic.uuid)
 
         if let error = error {
             logError("Subscribe failed: \(error.localizedDescription)", tag: tag)
@@ -798,15 +1008,4 @@ struct DebugLogEntry: Identifiable {
 
     var isError: Bool { level == .err }
     var isWarning: Bool { level == .warn }
-}
-
-struct PacketData: Identifiable {
-    let id = UUID()
-    let timestamp: Date
-    let characteristicUUID: String
-    let data: Data
-
-    var hexString: String {
-        data.map { String(format: "%02x", $0) }.joined()
-    }
 }
