@@ -79,15 +79,19 @@ final class MonthlySummary {
 }
 
 // One heart-rate reading from the WHOOP strap. Written at ~1 Hz while
-// the realtime stream is flowing.
+// the realtime stream is flowing. Historical inserts (from the strap's
+// page buffer via SEND_HISTORICAL_DATA) set `sourceKey` so re-syncs
+// don't double-insert the same page; realtime leaves it nil.
 @Model
 final class HRSample {
     var timestamp: Date
     var bpm: Int
+    var sourceKey: String? = nil
 
-    init(timestamp: Date, bpm: Int) {
+    init(timestamp: Date, bpm: Int, sourceKey: String? = nil) {
         self.timestamp = timestamp
         self.bpm = bpm
+        self.sourceKey = sourceKey
     }
 }
 

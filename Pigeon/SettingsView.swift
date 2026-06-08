@@ -79,6 +79,23 @@ struct WhoopDetailView: View {
 
             if bluetooth.connectionState == .connected {
                 Section {
+                    Button {
+                        bluetooth.sendHistoricalSync()
+                    } label: {
+                        HStack {
+                            Label(syncButtonTitle, systemImage: "clock.arrow.circlepath")
+                            Spacer()
+                            if bluetooth.historicalSyncInProgress {
+                                ProgressView().controlSize(.small)
+                            }
+                        }
+                    }
+                    .disabled(bluetooth.historicalSyncInProgress)
+                } footer: {
+                    Text(syncFooterText)
+                }
+
+                Section {
                     Button(role: .destructive) {
                         bluetooth.disconnect()
                     } label: {
@@ -133,6 +150,25 @@ struct WhoopDetailView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("WHOOP")
         .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private var syncButtonTitle: String {
+        if bluetooth.historicalSyncInProgress {
+            return "Syncing… \(bluetooth.historicalSyncPackets) packet\(bluetooth.historicalSyncPackets == 1 ? "" : "s")"
+        }
+        return "Sync History"
+    }
+
+    private var syncFooterText: String {
+        if bluetooth.historicalSyncInProgress {
+            return "Draining buffered K=18 pages from the strap. Watch the debug log for HIST/META."
+        }
+        if let last = bluetooth.lastHistoricalSyncAt {
+            let formatter = RelativeDateTimeFormatter()
+            formatter.unitsStyle = .abbreviated
+            return "Last synced \(formatter.localizedString(for: last, relativeTo: Date()))."
+        }
+        return "Never synced. Asks the strap to dump buffered history."
     }
 
     private var bluetoothStatusText: String {
@@ -369,28 +405,28 @@ struct DebugView: View {
                 RRStatusBanner(bluetooth: bluetooth, now: context.date)
             }
 
-            Divider()
-
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    let entries = filteredEntries
-                    if entries.isEmpty {
+            List {
+                let entries = filteredEntries
+                if entries.isEmpty {
+                    Section {
                         Text(emptyText)
-                            .font(.system(size: 15))
-                            .foregroundColor(.secondary)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 60)
-                    } else {
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .center)
+                            .padding(.vertical, 40)
+                    }
+                } else {
+                    Section {
                         ForEach(entries) { entry in
                             DebugLogRow(entry: entry)
-                            Divider().padding(.leading, 12)
+                                .listRowInsets(EdgeInsets())
+                                .listRowBackground(rowBackground(for: entry.level))
                         }
                     }
                 }
             }
-            .background(Color(.systemBackground))
+            .listStyle(.insetGrouped)
         }
-        .background(Color(.systemBackground))
+        .background(Color(.systemGroupedBackground))
         .navigationTitle("Debug")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -400,6 +436,14 @@ struct DebugView: View {
                 }
                 .disabled(bluetooth.debugLog.isEmpty)
             }
+        }
+    }
+
+    private func rowBackground(for level: DebugLogEntry.Level) -> Color {
+        switch level {
+        case .err: return Color.red.opacity(0.08)
+        case .warn: return Color.orange.opacity(0.08)
+        default: return Color(.secondarySystemGroupedBackground)
         }
     }
 
@@ -532,7 +576,6 @@ private struct DebugLogRow: View {
             .padding(.vertical, 8)
             .padding(.trailing, 12)
         }
-        .background(rowBackground)
     }
 
     private var timestampText: String {
@@ -555,14 +598,6 @@ private struct DebugLogRow: View {
         case .err: return .red
         case .warn: return .orange
         default: return .primary
-        }
-    }
-
-    private var rowBackground: Color {
-        switch entry.level {
-        case .err: return Color.red.opacity(0.06)
-        case .warn: return Color.orange.opacity(0.06)
-        default: return .clear
         }
     }
 }

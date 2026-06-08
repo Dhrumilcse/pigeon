@@ -88,6 +88,27 @@ class BluetoothManager: NSObject, ObservableObject {
 
     private var nextSequence: UInt8 = 2
 
+    // Historical sync state. Set on tap of "Sync History", cleared in
+    // finalizeHistoricalSync once we've ACKed all HistoryEnds and rebuilt
+    // summaries. One SEND_HISTORICAL_DATA can produce multiple HistoryStart →
+    // HistoryEnd batches; we ACK each batch and only finalize when an idle
+    // timer fires (or HistoryComplete arrives) signalling the strap is empty.
+    @Published private(set) var historicalSyncInProgress = false
+    @Published private(set) var historicalSyncPackets = 0
+    @Published private(set) var lastHistoricalSyncAt: Date?
+    private var historyEndAckedThisBatch = false
+    private var historicalUnsavedSincePersist = 0
+    private var historicalTouchedHours: Set<Date> = []
+    private var historicalTouchedDays: Set<Date> = []
+    private var historicalIdleTimer: DispatchWorkItem?
+    private static let historicalSaveChunkSize = 500
+    private static let historicalIdleSeconds: TimeInterval = 3
+    private static let lastHistoricalSyncKey = "pigeon.lastHistoricalSyncAt"
+
+    // Step 2a — dump one K=18 body hex per drain so we can keep eyeballing
+    // header layout vs Goose's protocol.rs:496-510 if anything looks off.
+    private var awaitingFirstK18Dump = false
+
     // Rolling RR-interval window for RMSSD HRV computation. Distinct from the
     // SwiftData @Model `RRSample` — this is the in-memory cache the math uses.
     private struct RRWindowEntry {
@@ -130,6 +151,7 @@ class BluetoothManager: NSObject, ObservableObject {
         self.modelContainer = modelContainer
         self.modelContext = ModelContext(modelContainer)
         super.init()
+        lastHistoricalSyncAt = UserDefaults.standard.object(forKey: Self.lastHistoricalSyncKey) as? Date
         backfillHourlySummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
@@ -211,6 +233,208 @@ class BluetoothManager: NSObject, ObservableObject {
         let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
         logTX("EXIT_HIGH_FREQ_SYNC seq=\(seq)", tag: "CMD", hex: hexStr)
         writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    // Send Historical Data: command 22 with empty payload (Goose:
+    // SEND_HISTORICAL_DATA). Asks the strap to dump its buffered K18 / K20 /
+    // K21 pages. K=18 carries one HR reading per ~17 s of strap time; we
+    // decode + persist those, ACK HistoryEnd once, then rebuild the affected
+    // hourly / daily / monthly summaries in a single batch.
+    func sendHistoricalSync() {
+        guard isAuthenticated,
+              let peripheral = connectedPeripheral,
+              let characteristic = commandCharacteristic else {
+            logWarn("Historical sync ignored — not authenticated", tag: "SYNC")
+            return
+        }
+        guard !historicalSyncInProgress else {
+            logWarn("Historical sync already in progress — ignoring tap", tag: "SYNC")
+            return
+        }
+        let seq = nextSequence
+        nextSequence &+= 1
+        let frame = Self.buildV5CommandFrame(sequence: seq, command: 22, data: [])
+        let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
+        logTX("SEND_HISTORICAL_DATA seq=\(seq)", tag: "SYNC", hex: hexStr)
+        historicalSyncInProgress = true
+        historicalSyncPackets = 0
+        historyEndAckedThisBatch = false
+        historicalUnsavedSincePersist = 0
+        historicalTouchedHours.removeAll()
+        historicalTouchedDays.removeAll()
+        historicalIdleTimer?.cancel()
+        historicalIdleTimer = nil
+        awaitingFirstK18Dump = true
+        writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    // Step 2a — dump the first K=18 payload of a drain so we can verify the
+    // header layout (counter_or_page u32 LE at [3], timestamp_seconds u32 LE at
+    // [7], timestamp_subseconds u16 LE at [11], body at [13..]) per Goose's
+    // protocol.rs:496-510 against this firmware before trusting the decoder.
+    private func dumpFirstK18ForVerification(payload: [UInt8]) {
+        let hex = payload.map { String(format: "%02x", $0) }.joined(separator: " ")
+        logRX("K18 raw payload (\(payload.count) B)", tag: "SYNC", hex: hex)
+        guard payload.count >= 13 else {
+            logWarn("K18 payload too short to decode header", tag: "SYNC")
+            return
+        }
+        let page = UInt32(payload[3]) | UInt32(payload[4]) << 8
+            | UInt32(payload[5]) << 16 | UInt32(payload[6]) << 24
+        let ts = UInt32(payload[7]) | UInt32(payload[8]) << 8
+            | UInt32(payload[9]) << 16 | UInt32(payload[10]) << 24
+        let sub = UInt16(payload[11]) | UInt16(payload[12]) << 8
+        let date = Date(timeIntervalSince1970: TimeInterval(ts))
+        let dateStr = DateFormatter.localizedString(from: date, dateStyle: .medium, timeStyle: .medium)
+        logInfo("K18 header: page=\(page) ts=\(ts) (\(dateStr)) sub=\(sub)", tag: "SYNC")
+    }
+
+    // Decode one K=18 historical packet → HRSample insert + bucket bookkeeping.
+    // Header layout (verified against this firmware in Step 2a):
+    //   payload[7..10] u32 LE = unix seconds, payload[14] u8 = HR (bpm).
+    // Inserts go directly into the model context. We flush every N packets so
+    // memory stays bounded regardless of drain size; the final flush + summary
+    // rebuild happens in finalizeHistoricalSync.
+    private func ingestHistoricalK18(payload: [UInt8]) {
+        guard payload.count > 14 else { return }
+        let page = UInt32(payload[3]) | UInt32(payload[4]) << 8
+            | UInt32(payload[5]) << 16 | UInt32(payload[6]) << 24
+        let ts = UInt32(payload[7]) | UInt32(payload[8]) << 8
+            | UInt32(payload[9]) << 16 | UInt32(payload[10]) << 24
+        let bpm = Int(payload[14])
+        // HR=0 means "no marker recorded this page" (firmware confidence gate);
+        // skip rather than poisoning min/avg with zeros. Out-of-range guards
+        // mirror the realtime path (30–220 bpm).
+        guard (30...220).contains(bpm) else { return }
+        let timestamp = Date(timeIntervalSince1970: TimeInterval(ts))
+
+        // Dedup: if we've already persisted this page, skip. Cheap because
+        // each drain is small (~hundreds of packets) and SwiftData indexes
+        // sourceKey lookups well enough for one fetch per insert.
+        let key = "k18:\(page)"
+        let descriptor = FetchDescriptor<HRSample>(predicate: #Predicate { $0.sourceKey == key })
+        if let existingCount = try? modelContext.fetchCount(descriptor), existingCount > 0 {
+            return
+        }
+
+        modelContext.insert(HRSample(timestamp: timestamp, bpm: bpm, sourceKey: key))
+        historicalTouchedHours.insert(hourStart(of: timestamp))
+        historicalTouchedDays.insert(Calendar.current.startOfDay(for: timestamp))
+        historicalSyncPackets += 1
+        historicalUnsavedSincePersist += 1
+
+        if historicalUnsavedSincePersist >= Self.historicalSaveChunkSize {
+            try? modelContext.save()
+            historicalUnsavedSincePersist = 0
+        }
+        scheduleHistoricalIdleFinalize()
+    }
+
+    // Reset the "strap went quiet" timer. We can't trust HistoryComplete to
+    // arrive (Step 1 + 2b runs showed it doesn't on this firmware), so this
+    // idle window is our actual end-of-stream signal. Called after every K=18
+    // ingest and every HistoryStart/HistoryEnd.
+    private func scheduleHistoricalIdleFinalize() {
+        historicalIdleTimer?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finalizeHistoricalSync()
+        }
+        historicalIdleTimer = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.historicalIdleSeconds, execute: workItem)
+    }
+
+    // Acknowledge the strap's HistoryEnd so it advances its read pointer and
+    // stops retransmitting kind=2. Payload mirrors Goose's parser
+    // (Parsing.swift:833-842): [0x01] + 8 bytes from offset 13..21 of the
+    // HistoryEnd metadata payload.
+    private func sendHistoryEndACK(historyEndPayload payload: [UInt8], peripheral: CBPeripheral) {
+        guard let characteristic = commandCharacteristic else { return }
+        guard payload.count >= 21 else {
+            logWarn("HistoryEnd payload too short for ACK (\(payload.count) B)", tag: "SYNC")
+            return
+        }
+        var ackPayload: [UInt8] = [0x01]
+        ackPayload.append(contentsOf: payload[13..<21])
+        let seq = nextSequence
+        nextSequence &+= 1
+        let frame = Self.buildV5CommandFrame(sequence: seq, command: 23, data: ackPayload)
+        let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
+        logTX("HISTORICAL_DATA_RESULT seq=\(seq)", tag: "SYNC", hex: hexStr)
+        writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    // Final flush + summary rebuild for the touched hours / days / months,
+    // then clear drain state. Called either when the strap goes idle for
+    // `historicalIdleSeconds` after the last batch ACK, or (defensively) when
+    // a HistoryComplete (kind=3) actually shows up. Idempotent — guarded so
+    // the idle timer and a late kind=3 can't double-finalize.
+    private func finalizeHistoricalSync() {
+        guard historicalSyncInProgress else { return }
+        historicalIdleTimer?.cancel()
+        historicalIdleTimer = nil
+        let packets = historicalSyncPackets
+        let hours = historicalTouchedHours
+        let days = historicalTouchedDays
+        try? modelContext.save()
+        historicalUnsavedSincePersist = 0
+
+        for hour in hours {
+            rebuildHourlySummaryFromSamples(for: hour)
+        }
+        let months: Set<Date> = Set(days.compactMap { day -> Date? in
+            let comps = Calendar.current.dateComponents([.year, .month], from: day)
+            return Calendar.current.date(from: comps)
+        })
+        for day in days {
+            rebuildDailySummaryFromSamples(for: day)
+            rebuildMonthlySummary(for: day)
+        }
+        try? modelContext.save()
+
+        historicalSyncInProgress = false
+        historicalTouchedHours.removeAll()
+        historicalTouchedDays.removeAll()
+        let completedAt = Date()
+        lastHistoricalSyncAt = completedAt
+        UserDefaults.standard.set(completedAt, forKey: Self.lastHistoricalSyncKey)
+        logOK("Historical sync complete — \(packets) HR samples, \(hours.count) hours, \(days.count) days, \(months.count) months", tag: "SYNC")
+    }
+
+    // Rebuild a HourlySummary row from every HRSample inside [hourStart, +1h).
+    // Idempotent — safe to run after partial realtime + historical inserts.
+    private func rebuildHourlySummaryFromSamples(for hourStart: Date) {
+        guard let hourEnd = Calendar.current.date(byAdding: .hour, value: 1, to: hourStart) else { return }
+        let descriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate { $0.timestamp >= hourStart && $0.timestamp < hourEnd }
+        )
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        let summary = fetchOrCreateHourlySummary(for: hourStart)
+        summary.hrSampleCount = samples.count
+        summary.sumHR = samples.reduce(0.0) { $0 + Double($1.bpm) }
+        summary.minHR = samples.map(\.bpm).min() ?? 0
+        summary.maxHR = samples.map(\.bpm).max() ?? 0
+    }
+
+    // Rebuild a DailySummary row from every HRSample + HRVSample inside the
+    // day. HRV is left alone if no historical HRV exists (Step 2 only writes
+    // historical HR; HRV stays realtime-only for now).
+    private func rebuildDailySummaryFromSamples(for dayStart: Date) {
+        guard let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) else { return }
+        let hrDescriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate { $0.timestamp >= dayStart && $0.timestamp < dayEnd }
+        )
+        let hrvDescriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate { $0.timestamp >= dayStart && $0.timestamp < dayEnd }
+        )
+        let hrSamples = (try? modelContext.fetch(hrDescriptor)) ?? []
+        let hrvSamples = (try? modelContext.fetch(hrvDescriptor)) ?? []
+        let summary = fetchOrCreateDailySummary(for: dayStart)
+        summary.hrSampleCount = hrSamples.count
+        summary.sumHR = hrSamples.reduce(0.0) { $0 + Double($1.bpm) }
+        summary.minHR = hrSamples.map(\.bpm).min() ?? 0
+        summary.maxHR = hrSamples.map(\.bpm).max() ?? 0
+        summary.hrvSampleCount = hrvSamples.count
+        summary.sumHRV = hrvSamples.reduce(0.0) { $0 + $1.rmssdMS }
     }
 
     private func writeCommand(_ frame: Data, to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
@@ -652,6 +876,40 @@ extension BluetoothManager: CBPeripheralDelegate {
             handleCommandResponse(payload: payload, peripheral: peripheral)
         case 0x28:
             handleRealtimeHR(frame: frame, peripheral: peripheral)
+        case 0x2F:
+            // HISTORICAL_DATA — payload[1] is the K-value (typically 18 on Gen5).
+            let k = payload.count > 1 ? payload[1] : 0
+            logRX("HIST K=\(k) len=\(frame.count)", tag: "SYNC")
+            if k == 18, awaitingFirstK18Dump {
+                awaitingFirstK18Dump = false
+                dumpFirstK18ForVerification(payload: payload)
+            }
+            if k == 18, historicalSyncInProgress {
+                ingestHistoricalK18(payload: payload)
+            }
+        case 0x31:
+            // METADATA — payload[2] is the kind (1=HistoryStart, 2=HistoryEnd,
+            // 3=HistoryComplete per Goose's HistoricalMetadataKind).
+            let kind = payload.count > 2 ? payload[2] : 0
+            logRX("META kind=\(kind) len=\(frame.count)", tag: "SYNC")
+            if historicalSyncInProgress {
+                switch kind {
+                case 1:
+                    // New batch beginning — reset the per-batch ACK gate.
+                    historyEndAckedThisBatch = false
+                    scheduleHistoricalIdleFinalize()
+                case 2:
+                    if !historyEndAckedThisBatch {
+                        historyEndAckedThisBatch = true
+                        sendHistoryEndACK(historyEndPayload: payload, peripheral: peripheral)
+                    }
+                    scheduleHistoricalIdleFinalize()
+                case 3:
+                    finalizeHistoricalSync()
+                default:
+                    break
+                }
+            }
         default:
             break // silently dropped — not subscribed to anything else right now
         }
