@@ -27,6 +27,33 @@ final class DailySummary {
     }
 }
 
+// Pre-aggregated hourly summary. One row per (calendar day, hour-of-day).
+// Updated in-place on every raw-sample write so the home card and detail
+// "D" tab can render from ~24 tiny rows instead of scanning HRSample.
+@Model
+final class HourlySummary {
+    var hourStart: Date     // top of the hour, local time
+    var hrSampleCount: Int
+    var sumHR: Double       // avgHR = sumHR / hrSampleCount
+    var minHR: Int
+    var maxHR: Int
+    var hrvSampleCount: Int = 0
+    var sumHRV: Double = 0  // avgHRV = sumHRV / hrvSampleCount
+
+    var avgHR: Double { hrSampleCount > 0 ? sumHR / Double(hrSampleCount) : 0 }
+    var avgHRV: Double? { hrvSampleCount > 0 ? sumHRV / Double(hrvSampleCount) : nil }
+
+    init(hourStart: Date) {
+        self.hourStart = hourStart
+        self.hrSampleCount = 0
+        self.sumHR = 0
+        self.minHR = 0
+        self.maxHR = 0
+        self.hrvSampleCount = 0
+        self.sumHRV = 0
+    }
+}
+
 // Pre-aggregated monthly summary. One row per calendar month.
 // Recomputed from the daily rows for that month (≤31 fetches) whenever
 // a daily summary changes — far cheaper than scanning raw samples.

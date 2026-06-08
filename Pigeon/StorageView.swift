@@ -5,6 +5,10 @@ struct LocalStorageView: View {
     var body: some View {
         List {
             Section {
+                NavigationLink(destination: HourlySummaryTableView()) {
+                    TableRowLabel(icon: "clock", color: .teal, name: "HourlySummary",
+                                  subtitle: "Pre-aggregated HR per hour")
+                }
                 NavigationLink(destination: DailySummaryTableView()) {
                     TableRowLabel(icon: "calendar", color: .blue, name: "DailySummary",
                                   subtitle: "Pre-aggregated HR + HRV per day")
@@ -37,6 +41,56 @@ struct LocalStorageView: View {
 }
 
 // MARK: - Table detail views
+
+struct HourlySummaryTableView: View {
+    @Query(sort: \HourlySummary.hourStart, order: .reverse) private var rows: [HourlySummary]
+
+    private static let schema: [(String, String)] = [
+        ("hourStart",      "Date — top of the hour, local time"),
+        ("hrSampleCount",  "Int — raw HR inserts in this hour"),
+        ("sumHR",          "Double — running sum of bpm"),
+        ("minHR",          "Int — lowest bpm in hour"),
+        ("maxHR",          "Int — highest bpm in hour"),
+        ("hrvSampleCount", "Int — RMSSD values computed in this hour"),
+        ("sumHRV",         "Double — running sum of RMSSD"),
+        ("avgHR",          "Double (computed) — sumHR / hrSampleCount"),
+        ("avgHRV",         "Double? (computed) — sumHRV / hrvSampleCount"),
+    ]
+
+    private static let hourFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h a"; return f
+    }()
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Last 50 of \(rows.count)")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows.prefix(50)) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(Self.hourFmt.string(from: row.hourStart))
+                            .font(.headline)
+                        KV("hr_samples",  "\(row.hrSampleCount)")
+                        KV("avg_hr",      row.hrSampleCount > 0 ? String(format: "%.1f bpm", row.avgHR) : "—")
+                        KV("min/max",     row.hrSampleCount > 0 ? "\(row.minHR) / \(row.maxHR) bpm" : "—")
+                        KV("hrv_samples", "\(row.hrvSampleCount)")
+                        if let avg = row.avgHRV {
+                            KV("avg_hrv", String(format: "%.1f ms", avg))
+                        } else {
+                            KV("avg_hrv", "—")
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("HourlySummary")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
 
 struct DailySummaryTableView: View {
     @Query(sort: \DailySummary.date, order: .reverse) private var rows: [DailySummary]

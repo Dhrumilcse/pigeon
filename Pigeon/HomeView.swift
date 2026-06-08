@@ -12,68 +12,60 @@ struct HomeView: View {
                 if bluetooth.connectionState == .connected {
                     ScrollView {
                         VStack(spacing: 24) {
-                            LiveHeartRateReadout(bpm: bluetooth.currentHeartRate)
-                                .padding(.vertical, 32)
-
-                            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 16) {
-                                MetricCard(
-                                    title: "HRV",
-                                    value: bluetooth.currentHRV.map { "\(Int($0.rounded())) ms" } ?? "—"
-                                )
-                                MetricCard(
-                                    title: "Battery",
-                                    value: bluetooth.batteryLevel.map { "\($0)%" } ?? "—"
-                                )
+                            HStack(alignment: .firstTextBaseline) {
+                                Text("Home")
+                                    .font(.system(size: 34, weight: .bold))
+                                Spacer()
+                                LiveHRPill(bpm: bluetooth.currentHeartRate)
                             }
-                            .padding(.horizontal, 24)
+                            .padding(.horizontal, 20)
+                            .padding(.top, 8)
+
+                            VStack(spacing: 12) {
+                                NavigationLink {
+                                    HeartRateDetailView()
+                                } label: {
+                                    HeartRateCard()
+                                }
+                                .buttonStyle(.plain)
+
+                                NavigationLink {
+                                    HRVDetailView()
+                                } label: {
+                                    HRVCard()
+                                }
+                                .buttonStyle(.plain)
+                            }
+                            .padding(.horizontal, 16)
 
                             Spacer(minLength: 24)
                         }
-                        .padding(.top, 24)
+                        .padding(.top, 8)
                     }
                 } else {
                     DisconnectedState()
                 }
             }
-            .navigationTitle("Home")
-            .navigationBarTitleDisplayMode(.large)
+            .navigationBarHidden(true)
         }
     }
 }
 
-// MARK: - Live HR readout
+// MARK: - Live HR pill
 
-private struct LiveHeartRateReadout: View {
+private struct LiveHRPill: View {
     let bpm: Int?
 
     var body: some View {
-        VStack(spacing: 16) {
-            if let bpm {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("\(bpm)")
-                        .font(.system(size: 96, weight: .bold, design: .rounded))
-                        .foregroundColor(.primary)
-                    Text("bpm")
-                        .font(.system(size: 28, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .padding(.bottom, 12)
-                }
-                HStack(spacing: 8) {
-                    Circle().fill(Color.red).frame(width: 10, height: 10)
-                    Text("Live")
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundColor(.secondary)
-                }
-            } else {
-                Text("--")
-                    .font(.system(size: 96, weight: .bold, design: .rounded))
-                    .foregroundColor(.secondary.opacity(0.3))
-                Text("Waiting for data")
-                    .font(.system(size: 15, weight: .medium))
-                    .foregroundColor(.secondary)
-            }
+        HStack(spacing: 6) {
+            Image(systemName: "heart.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(.red)
+            Text(bpm.map { "\($0)" } ?? "—")
+                .font(.system(size: 22, weight: .semibold, design: .rounded))
+                .foregroundColor(.primary)
+                .monospacedDigit()
         }
-        .frame(maxWidth: .infinity)
     }
 }
 
@@ -94,30 +86,6 @@ private struct DisconnectedState: View {
             }
             Spacer()
         }
-    }
-}
-
-struct MetricCard: View {
-    let title: String
-    let value: String
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Text(title)
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(.secondary)
-            Text(value)
-                .font(.system(size: 20, weight: .bold))
-                .foregroundColor(.primary)
-                .lineLimit(1)
-                .minimumScaleFactor(0.5)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .background(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .fill(Color(.systemGray6))
-        )
     }
 }
 

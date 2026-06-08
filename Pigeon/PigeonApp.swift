@@ -8,7 +8,7 @@ struct PigeonApp: App {
     init() {
         do {
             modelContainer = try ModelContainer(for: HRSample.self, RRSample.self, HRVSample.self,
-                                                    DailySummary.self, MonthlySummary.self)
+                                                    HourlySummary.self, DailySummary.self, MonthlySummary.self)
         } catch {
             fatalError("Failed to create ModelContainer: \(error)")
         }

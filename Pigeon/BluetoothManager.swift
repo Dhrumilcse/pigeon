@@ -129,6 +129,7 @@ class BluetoothManager: NSObject, ObservableObject {
         self.modelContainer = modelContainer
         self.modelContext = ModelContext(modelContainer)
         super.init()
+        backfillHourlySummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -762,8 +763,10 @@ extension BluetoothManager: CBPeripheralDelegate {
     // trimming. If storage ever feels heavy, switch to hourly roll-ups for
     // data older than ~30 days.
     private func persistHeartRateSample(_ bpm: Int) {
-        modelContext.insert(HRSample(timestamp: Date(), bpm: bpm))
+        let now = Date()
+        modelContext.insert(HRSample(timestamp: now, bpm: bpm))
         updateDailySummary(bpm: bpm)
+        updateHourlySummary(bpm: bpm, at: now)
     }
 
     // MARK: - Summary aggregation
@@ -789,6 +792,99 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.sumHRV += rmssd
         summary.hrvSampleCount += 1
         rebuildMonthlySummary(for: today)
+    }
+
+    private func updateHourlySummary(bpm: Int, at timestamp: Date) {
+        let hourStart = hourStart(of: timestamp)
+        let summary = fetchOrCreateHourlySummary(for: hourStart)
+        if summary.hrSampleCount == 0 {
+            summary.minHR = bpm
+            summary.maxHR = bpm
+        } else {
+            summary.minHR = min(summary.minHR, bpm)
+            summary.maxHR = max(summary.maxHR, bpm)
+        }
+        summary.sumHR += Double(bpm)
+        summary.hrSampleCount += 1
+    }
+
+    private func updateHourlySummaryHRV(_ rmssd: Double, at timestamp: Date) {
+        let hourStart = hourStart(of: timestamp)
+        let summary = fetchOrCreateHourlySummary(for: hourStart)
+        summary.sumHRV += rmssd
+        summary.hrvSampleCount += 1
+    }
+
+    private func fetchOrCreateHourlySummary(for hourStart: Date) -> HourlySummary {
+        let descriptor = FetchDescriptor<HourlySummary>(
+            predicate: #Predicate { $0.hourStart == hourStart }
+        )
+        if let existing = (try? modelContext.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = HourlySummary(hourStart: hourStart)
+        modelContext.insert(summary)
+        return summary
+    }
+
+    private func hourStart(of date: Date) -> Date {
+        let cal = Calendar.current
+        let comps = cal.dateComponents([.year, .month, .day, .hour], from: date)
+        return cal.date(from: comps) ?? date
+    }
+
+    // Backfill HourlySummary rows from existing samples. Each metric is
+    // backfilled independently — added later means earlier installs still
+    // catch up on missing HRV without redoing HR.
+    private func backfillHourlySummariesIfNeeded() {
+        let hadHourlyAlready = (try? modelContext.fetchCount(FetchDescriptor<HourlySummary>())) ?? 0 > 0
+
+        var rowCache: [Date: HourlySummary] = [:]
+        func row(for hour: Date) -> HourlySummary {
+            if let r = rowCache[hour] { return r }
+            let descriptor = FetchDescriptor<HourlySummary>(predicate: #Predicate { $0.hourStart == hour })
+            if let existing = (try? modelContext.fetch(descriptor))?.first {
+                rowCache[hour] = existing
+                return existing
+            }
+            let r = HourlySummary(hourStart: hour)
+            modelContext.insert(r)
+            rowCache[hour] = r
+            return r
+        }
+
+        // HR backfill: skip if any HourlySummary rows already exist
+        // (we always touch the current hour when a sample arrives, so any
+        // existing rows mean the HR pass already ran).
+        if !hadHourlyAlready {
+            let hrSamples = (try? modelContext.fetch(FetchDescriptor<HRSample>(sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+            for s in hrSamples {
+                let r = row(for: hourStart(of: s.timestamp))
+                if r.hrSampleCount == 0 {
+                    r.minHR = s.bpm
+                    r.maxHR = s.bpm
+                } else {
+                    r.minHR = min(r.minHR, s.bpm)
+                    r.maxHR = max(r.maxHR, s.bpm)
+                }
+                r.sumHR += Double(s.bpm)
+                r.hrSampleCount += 1
+            }
+        }
+
+        // HRV backfill: skip if any HourlySummary already has HRV data.
+        let hrvDescriptor = FetchDescriptor<HourlySummary>(predicate: #Predicate { $0.hrvSampleCount > 0 })
+        let hadHRV = (try? modelContext.fetchCount(hrvDescriptor)) ?? 0 > 0
+        if !hadHRV {
+            let hrvSamples = (try? modelContext.fetch(FetchDescriptor<HRVSample>(sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+            for s in hrvSamples {
+                let r = row(for: hourStart(of: s.timestamp))
+                r.sumHRV += s.rmssdMS
+                r.hrvSampleCount += 1
+            }
+        }
+
+        try? modelContext.save()
     }
 
     private func fetchOrCreateDailySummary(for startOfDay: Date) -> DailySummary {
@@ -880,6 +976,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         lastHRVUpdate = now
         modelContext.insert(HRVSample(timestamp: now, rmssdMS: rmssd))
         updateDailySummaryHRV(rmssd)
+        updateHourlySummaryHRV(rmssd, at: now)
         let skippedTag = skippedDiffs > 0 ? " skipped=\(skippedDiffs)" : ""
         logOK("RMSSD=\(String(format: "%.1f", rmssd))ms n=\(rrWindow.count)\(skippedTag)", tag: "HRV")
     }

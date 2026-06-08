@@ -31,6 +31,14 @@ struct SettingsView: View {
                     }
                 }
 
+                Section("Calculations") {
+                    NavigationLink {
+                        HRVAboutView()
+                    } label: {
+                        SettingsRow(icon: "waveform.path.ecg", iconColor: .purple, title: "Heart Rate Variability")
+                    }
+                }
+
                 Section {
                     NavigationLink {
                         SamplesListView(bluetooth: bluetooth)
@@ -977,6 +985,47 @@ private struct MonthlyHRChartBody: View {
         guard !withData.isEmpty else { return "—" }
         let avg = withData.map(\.avgHR).reduce(0, +) / Double(withData.count)
         return "\(Int(avg.rounded()))"
+    }
+}
+
+// MARK: - About HRV
+
+struct HRVAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Heart Rate Variability")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Heart rate variability (HRV) is the variation in time between consecutive heartbeats, measured in milliseconds. Even at a steady resting heart rate, the interval between beats is constantly fluctuating.")
+
+                    Text("A higher HRV generally indicates a well-recovered, adaptable nervous system, while a lower HRV can reflect stress, fatigue, illness, or under-recovery.")
+
+                    Text("HRV is driven by the balance between your sympathetic (\u{201C}fight or flight\u{201D}) and parasympathetic (\u{201C}rest and digest\u{201D}) nervous systems. The parasympathetic side, acting through the vagus nerve, is what produces most of the beat-to-beat variation you see in HRV.")
+
+                    Text("Pigeon computes HRV using RMSSD — the root mean square of successive R-R interval differences — over the most recent valid beats reported by the strap. RMSSD is the standard short-window HRV metric and primarily reflects parasympathetic activity.")
+
+                    Text("HRV is highly personal. Absolute values vary widely between individuals based on age, fitness, genetics, and sensor placement, so trends over time for the same person are far more meaningful than comparisons to others.")
+
+                    Text("For the most consistent readings, HRV is best measured under similar conditions each day — for example, during sleep or in a quiet moment shortly after waking, before caffeine or activity.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Heart Rate Variability")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
