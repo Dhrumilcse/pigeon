@@ -361,7 +361,7 @@ struct DebugView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
+            .padding(.horizontal, Layout.screenHMargin)
             .padding(.vertical, 10)
             .background(Color(.systemGroupedBackground))
 
@@ -452,7 +452,7 @@ private struct RRStatusBanner: View {
                 .foregroundColor(.primary)
             Spacer()
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, Layout.screenHMargin)
         .padding(.vertical, 8)
         .background(Color(.secondarySystemGroupedBackground))
     }
@@ -709,7 +709,8 @@ struct HeartRateChartView: View {
                     MonthlyHRChartBody().id(range)
                 }
             }
-            .padding(20)
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate")
@@ -1021,7 +1022,8 @@ struct HRVAboutView: View {
                         .fill(Color(.secondarySystemGroupedBackground))
                 )
             }
-            .padding(20)
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate Variability")
@@ -1061,7 +1063,8 @@ struct HRVChartView: View {
                     MonthlyHRVChartBody().id(range)
                 }
             }
-            .padding(20)
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate Variability")

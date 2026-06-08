@@ -18,7 +18,7 @@ struct HomeView: View {
                                 Spacer()
                                 LiveHRPill(bpm: bluetooth.currentHeartRate)
                             }
-                            .padding(.horizontal, 20)
+                            .padding(.horizontal, Layout.screenHMargin)
                             .padding(.top, 8)
 
                             VStack(spacing: 12) {
@@ -36,7 +36,7 @@ struct HomeView: View {
                                 }
                                 .buttonStyle(.plain)
                             }
-                            .padding(.horizontal, 16)
+                            .padding(.horizontal, Layout.screenHMargin)
 
                             Spacer(minLength: 24)
                         }

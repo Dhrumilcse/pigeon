@@ -127,7 +127,8 @@ struct HRVDetailView: View {
                     MonthlyHRVChartBody().id(range)
                 }
             }
-            .padding(20)
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
         }
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate Variability")

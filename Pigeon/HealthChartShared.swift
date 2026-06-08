@@ -4,6 +4,11 @@ import Charts
 // Shared infrastructure for Apple Health-style metric detail charts.
 // HR and HRV both feed into ChartContainer with their own tint + units.
 
+enum Layout {
+    // Gap on the left and right of every screen's content (titles, cards, lists).
+    static let screenHMargin: CGFloat = 20
+}
+
 enum HealthTimeRange: String, CaseIterable, Identifiable {
     case day = "D"
     case week = "W"
