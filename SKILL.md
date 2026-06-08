@@ -8,9 +8,10 @@ You're working on an iOS app that talks to a WHOOP 5.0 strap over BLE, persists 
 - **`CLIENT_HELLO`** (cmd `0x91`) — hardcoded 16-byte auth frame, verified against Goose.
 - **After-auth command sequence**: `EXIT_HIGH_FREQ_SYNC` (cmd `0x61`) to stop the historical firehose, then `TOGGLE_REALTIME_HR_ON` (cmd `0x03` payload `[1]`) to start the K2 stream. Both built dynamically via `buildV5CommandFrame`.
 - **V5 reassembly** — long frames (K20 = 2140 B, K21 = 1244 B) arrive as multiple ~244 B BLE notifications; `processV5Chunk` stitches them back into a single logical frame keyed by characteristic UUID.
-- **V5 dispatcher (focused)** — `handleCompleteV5Frame` only handles `0x24` COMMAND_RESPONSE and `0x28` REALTIME_DATA (K2). Everything else (historical, raw, metadata, console logs) is silently dropped — we told the strap not to send it.
+- **V5 dispatcher (focused)** — `handleCompleteV5Frame` always handles `0x24` COMMAND_RESPONSE and `0x28` REALTIME_DATA (K2). `0x2F` HISTORICAL_DATA and `0x31` METADATA are decoded only while `historicalSyncInProgress == true` (i.e. between the Sync History tap and the idle-timer finalize). Raw motion, console logs, and other K-types are silently dropped.
 - **HR + RR + HRV computation** — K2 byte `[8]` = HR, byte `[9]` = RR count, bytes `[10+]` = RR intervals (u16 LE in 1/1024 s → ms). `ingestRRIntervals` keeps a 60 s rolling window with min/max RR filter (300-2000 ms) and ectopic-diff filter (max 200 ms successive delta), publishes RMSSD.
-- **Persistence (SwiftData)** — `HRSample`, `RRSample`, `HRVSample` are `@Model` classes in `Models.swift`. Every valid HR, every filtered R-R, and every RMSSD is inserted via a `ModelContext` the `BluetoothManager` owns. Retention = forever.
+- **Persistence (SwiftData)** — `HRSample`, `RRSample`, `HRVSample` plus `HourlySummary` / `DailySummary` / `MonthlySummary` are `@Model` classes in `Models.swift`. Every valid HR, every filtered R-R, and every RMSSD is inserted via a `ModelContext` the `BluetoothManager` owns. Realtime updates touch the summary rows incrementally; historical drains rebuild them in batch (see below). Retention = forever.
+- **Historical sync** — Sync History button in Settings → WHOOP sends `SEND_HISTORICAL_DATA` (cmd 22). The dispatcher routes `0x2F`/`0x31` to a state machine that decodes K=18 → `HRSample` (timestamp at payload [7..10], HR at [14]), ACKs each `HistoryEnd` (metadata kind=2) with `HISTORICAL_DATA_RESULT` (cmd 23, payload `[0x01] + HistoryEnd[13..21]`), dedupes via `HRSample.sourceKey = "k18:<page>"`, flushes every 500 packets, and finalizes on either `HistoryComplete` (kind=3) or a 3 s idle timeout — whichever comes first. Finalize rebuilds the touched hourly/daily/monthly summary rows from scratch by re-folding raw `HRSample` rows for those buckets, then persists `lastHistoricalSyncAt` to `UserDefaults` (key `pigeon.lastHistoricalSyncAt`).
 - **Background BLE** — `Info.plist` declares `UIBackgroundModes: bluetooth-central`. Connection survives backgrounding.
 - **State restoration** — `CBCentralManager` initialized with `CBCentralManagerOptionRestoreIdentifierKey: "pigeon.central"`. `centralManager(_:willRestoreState:)` re-attaches the delegate to restored peripherals and re-runs service discovery so the auth + realtime sequence flows again.
 - **Standard public services** — `0x180A` device info (manufacturer, model, serial, FW, HW) + `0x180F` battery surfaced on the General / Battery pages.
@@ -59,6 +60,28 @@ on fd4b0005 K2 frame:  parseV5RealtimeData → currentHeartRate / RR / HRV
                        + SwiftData inserts (HRSample, RRSample, HRVSample)
 ```
 
+Sync History drain (separate, manually triggered):
+
+```
+tap "Sync History" → historicalSyncInProgress = true
+                  → send SEND_HISTORICAL_DATA (cmd 22)
+            ↓
+strap streams batches on fd4b0005:
+    META kind=1 (HistoryStart)
+    HIST K=18  (decode → HRSample with sourceKey="k18:<page>", dedup, batched save every 500)
+    HIST K=20, K=21  (logged, not decoded)
+    META kind=2 (HistoryEnd) → send HISTORICAL_DATA_RESULT (cmd 23) once per batch
+    (strap moves to next batch — repeat HistoryStart…)
+            ↓
+either META kind=3 (HistoryComplete) OR 3 s of silence
+    → finalizeHistoricalSync:
+        try? modelContext.save()
+        for each touched hour:  rebuildHourlySummaryFromSamples
+        for each touched day:   rebuildDailySummaryFromSamples + rebuildMonthlySummary
+        historicalSyncInProgress = false
+        lastHistoricalSyncAt = now  (UserDefaults)
+```
+
 `didUpdateValueFor` has three branches (in order):
 
 1. `handleStandardCharacteristic` — public GATT (`0x180A` info, `0x180F` battery). Returns true → handled.
@@ -69,6 +92,8 @@ on fd4b0005 K2 frame:  parseV5RealtimeData → currentHeartRate / RR / HRV
 
 - `0x24` COMMAND_RESPONSE → `handleCommandResponse` (auth-ack triggers the EXIT + REALTIME_HR sequence; everything else just logs `ack cmd=… → RESULT_NAME`).
 - `0x28` REALTIME_DATA → `handleRealtimeHR` (parses K2, updates published state, persists samples).
+- `0x2F` HISTORICAL_DATA → logs K-value/length; if K=18 and `historicalSyncInProgress`, calls `ingestHistoricalK18`.
+- `0x31` METADATA → logs kind/length; if `historicalSyncInProgress`, drives the sync state machine (kind=1 resets the per-batch ACK gate, kind=2 sends the ACK and resets the idle timer, kind=3 finalizes).
 - default → drop silently.
 
 ## Empirical findings worth knowing
@@ -77,7 +102,10 @@ on fd4b0005 K2 frame:  parseV5RealtimeData → currentHeartRate / RR / HRV
 - **RR is firmware-gated**: the strap's beat detector applies a confidence gate at the source. When optical signal is noisy (motion, slack contact), it emits HR but withholds the R-peak marks. Missed RR is **not** recoverable — the strap doesn't buffer beat-by-beat data for later sync. Goose's investigation confirms historical packets (K18/K24) carry only aggregated respiratory rate, not beat-by-beat RR.
 - **Beat-by-beat data lives in R17 (K17) optical/PPG packets** — not enabled in Pigeon. Goose enables it with `cmd 107` (`ENABLE_OPTICAL_DATA_ON`) using `[1, 1]` payload (the Gen5 "revision boolean" format). This is the path to making HRV robust across activity levels, deferred for now.
 - **Cmd 63 (`SEND_R10_R11_REALTIME_ON`) is `UNSUPPORTED` on Gen5 firmware `50.38.1.0`**. Returns `result_code = 3` in the ack. Removed from Pigeon's command sequence.
-- **The strap's internal subsystems emit `cmd 22 / cmd 23` acks** during historical-sync mode — those are `SEND_HISTORICAL_DATA` and `HISTORICAL_DATA_RESULT` (we don't send them; they're strap-side internals visible on `fd4b0003`). Pre-`EXIT_HIGH_FREQ_SYNC` you'll see them in the log; after, they typically taper off.
+- **Historical drain runs in batches, not one continuous dump.** One `SEND_HISTORICAL_DATA` produces a series of `HistoryStart → K-packets → HistoryEnd` batches. Each `HistoryEnd` must be ACKed individually before the strap will send the next batch. Without the ACK the strap retransmits `HistoryEnd` every ~2 s and never sends `HistoryComplete`. ACK payload = `[0x01] + HistoryEnd[13..21]`.
+- **K=18 carries only HR (offset 14), no RR / HRV.** Goose's `history_hr_marker_offset(18) = 14` and `parse_data_packet_body_summary` treats it as a present/absent marker; empirically the byte IS the bpm value on this firmware (validated against the realtime range). Beat-by-beat data is firmware-discarded — the only path to richer historical HRV is the realtime R17 PPG stream (cmd 107), which is a separate feature.
+- **The strap's local page buffer is small (~1 hour observed on Gen5 firmware `50.38.1.0`)** and shared with the WHOOP official app. Anything that app ACKs is gone for Pigeon too. Sync History only catches what's accumulated since the last drain by either client; it does not backfill multi-day gaps.
+- **Realtime never pauses during the drain.** K2 frames keep flowing at ~1 Hz interleaved with the K=18/20/21 burst on the same characteristic. No need to disable realtime before tapping Sync History; no need to re-enable it after.
 - **Flags bytes in the V5 header**: `00 01` = app→strap, `01 00` = strap→app. The header CRC covers them.
 - **`PacketParser.swift` and the legacy heuristic HR scanner are deleted** — `2A37` is no longer subscribed (it double-counted RR into HRV) and the heuristic was a foot-gun (matched any byte in 40-200 → on V5 frames, the SOF byte `0xaa` became HR=170).
 
@@ -147,7 +175,8 @@ If asked to send a new WHOOP command:
 
 ## Open questions for the next agent
 
-- **HRV during activity** — currently relies on K2 RR which is firmware-gated. The R17 PPG stream (cmd 107, payload `[1, 1]`) would give beat-by-beat data even during exercise. Untried because Gen5 might respond `UNSUPPORTED`.
-- **K20 (~2140 B) decoder** — not in Goose. Could carry sleep aggregates or something else. Currently dropped.
+- **HRV during activity** — currently relies on K2 RR which is firmware-gated. Historical sync (K=18) doesn't help — Goose's notes and our investigation both confirm K=18 carries only HR. The R17 PPG stream (cmd 107, payload `[1, 1]`) would give beat-by-beat data even during exercise; untried because Gen5 might respond `UNSUPPORTED`.
+- **K=20 (2140 B) decoder** — arrives during historical drains alongside K=18, currently dropped. Not in Goose. Likely sleep / per-page aggregates; would need a packet capture and reverse-engineering pass.
+- **K=18 body beyond [14]** — we extract HR only. Remaining 97 bytes carry other aggregates (respiratory rate, body temp markers) per Goose's `parse_data_packet_body_summary`. Decoding these would broaden what Sync History contributes per page.
 - **Apple HealthKit mirror** — would make samples visible in the Health app. Adds entitlement + permission flow.
 - **Persistence migration story** — schema is fixed once a user starts collecting. Add `VersionedSchema` before any model field changes.
