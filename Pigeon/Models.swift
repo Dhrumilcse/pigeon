@@ -121,3 +121,67 @@ final class HRVSample {
         self.rmssdMS = rmssdMS
     }
 }
+
+// One compact accelerometer aggregate from a WHOOP Raw43/K21 frame.
+// Each raw frame carries 100 samples per axis; we store summary stats so
+// sleep/walk/activity logic can use the motion signal without persisting the
+// full high-rate stream.
+@Model
+final class MotionSample {
+    var timestamp: Date
+    var sampleCount: Int
+
+    var meanXG: Double
+    var meanYG: Double
+    var meanZG: Double
+    var magnitudeG: Double
+
+    var minXG: Double
+    var maxXG: Double
+    var minYG: Double
+    var maxYG: Double
+    var minZG: Double
+    var maxZG: Double
+
+    var rmsDeviationG: Double
+    var meanDeltaG: Double
+    var maxDeltaG: Double
+
+    var sourceKey: String?
+
+    init(
+        timestamp: Date,
+        sampleCount: Int,
+        meanXG: Double,
+        meanYG: Double,
+        meanZG: Double,
+        magnitudeG: Double,
+        minXG: Double,
+        maxXG: Double,
+        minYG: Double,
+        maxYG: Double,
+        minZG: Double,
+        maxZG: Double,
+        rmsDeviationG: Double,
+        meanDeltaG: Double,
+        maxDeltaG: Double,
+        sourceKey: String? = nil
+    ) {
+        self.timestamp = timestamp
+        self.sampleCount = sampleCount
+        self.meanXG = meanXG
+        self.meanYG = meanYG
+        self.meanZG = meanZG
+        self.magnitudeG = magnitudeG
+        self.minXG = minXG
+        self.maxXG = maxXG
+        self.minYG = minYG
+        self.maxYG = maxYG
+        self.minZG = minZG
+        self.maxZG = maxZG
+        self.rmsDeviationG = rmsDeviationG
+        self.meanDeltaG = meanDeltaG
+        self.maxDeltaG = maxDeltaG
+        self.sourceKey = sourceKey
+    }
+}

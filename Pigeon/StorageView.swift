@@ -32,6 +32,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "waveform", color: .purple, name: "HRVSample",
                                   subtitle: "RMSSD computed per 60 s window")
                 }
+                NavigationLink(destination: MotionSampleTableView()) {
+                    TableRowLabel(icon: "figure.walk.motion", color: .orange, name: "MotionSample",
+                                  subtitle: "Compact Raw43 accelerometer aggregates")
+                }
             } header: { Text("Raw Samples") }
         }
         .listStyle(.insetGrouped)
@@ -277,6 +281,55 @@ struct HRVSampleTableView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("HRVSample")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct MotionSampleTableView: View {
+    @Query(sort: \MotionSample.timestamp, order: .reverse) private var rows: [MotionSample]
+
+    init() {
+        _rows = Query(sort: \MotionSample.timestamp, order: .reverse)
+    }
+
+    private static let schema: [(String, String)] = [
+        ("timestamp",     "Date — Raw43 frame timestamp from the strap"),
+        ("sampleCount",   "Int — accel samples per axis in the frame"),
+        ("meanX/Y/ZG",    "Double — mean gravity/accel per axis, in g"),
+        ("magnitudeG",    "Double — sqrt(meanX² + meanY² + meanZ²)"),
+        ("min/max X/Y/Z", "Double — per-axis range within the frame, in g"),
+        ("rmsDeviationG", "Double — spread around the mean vector; useful for movement intensity"),
+        ("meanDeltaG",    "Double — average sample-to-sample vector change"),
+        ("maxDeltaG",     "Double — largest sample-to-sample vector change"),
+        ("sourceKey",     "String? — raw43 timestamp/subseconds/header key"),
+    ]
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Last 100 of \(rows.count)")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows.prefix(100)) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.timestamp.formatted(date: .omitted, time: .standard))
+                            .font(.headline.monospacedDigit())
+                        KV("n", "\(row.sampleCount)")
+                        KV("mean_xyz", String(format: "%.3f / %.3f / %.3f g", row.meanXG, row.meanYG, row.meanZG))
+                        KV("|g|", String(format: "%.3f", row.magnitudeG))
+                        KV("range_x", String(format: "%.3f ... %.3f g", row.minXG, row.maxXG))
+                        KV("range_y", String(format: "%.3f ... %.3f g", row.minYG, row.maxYG))
+                        KV("range_z", String(format: "%.3f ... %.3f g", row.minZG, row.maxZG))
+                        KV("rms", String(format: "%.4f g", row.rmsDeviationG))
+                        KV("delta_avg/max", String(format: "%.4f / %.4f g", row.meanDeltaG, row.maxDeltaG))
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("MotionSample")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

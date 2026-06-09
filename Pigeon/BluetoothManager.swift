@@ -12,9 +12,12 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published var currentHeartRate: Int?
     @Published var lastHeartRateUpdate: Date?
     @Published var lastRRReceivedAt: Date?
+    @Published private(set) var rrSessionSamples = 0
     @Published var currentHRV: Double?
     @Published var lastHRVUpdate: Date?
     @Published var debugLog: [DebugLogEntry] = []
+    @Published private(set) var motionProbeInProgress = false
+    @Published private(set) var motionProbeFrames = 0
 
     // Standard public-service info (read from 0x180A / 0x180F)
     @Published var manufacturerName: String?
@@ -111,6 +114,22 @@ class BluetoothManager: NSObject, ObservableObject {
     // header layout vs Goose's protocol.rs:496-510 if anything looks off.
     private var awaitingFirstK18Dump = false
 
+    // Debug-only bounded accelerometer probe. This deliberately does not
+    // persist anything; it only observes complete V5 frames after reassembly.
+    private var motionProbeStopWorkItem: DispatchWorkItem?
+    private var motionProbeStopVerificationWorkItem: DispatchWorkItem?
+    private var motionProbeStartedAt: Date?
+    private var motionProbeTypeCounts: [UInt8: Int] = [:]
+    private var motionProbeKCounts: [UInt8: Int] = [:]
+    private var motionProbeRawFrameCount = 0
+    private var motionProbePostStopRawFrames = 0
+    private var motionProbeCandidateLogs = 0
+    private var motionProbeFirstFrameLogged = false
+    private var motionProbeRejectedCandidateCount = 0
+    private static let motionProbeDefaultSeconds: TimeInterval = 30
+    private static let motionProbeMaxCandidateLogs = 8
+    private static let motionProbeStopVerificationSeconds: TimeInterval = 3
+
     // Rolling RR-interval window for RMSSD HRV computation. Distinct from the
     // SwiftData @Model `RRSample` — this is the in-memory cache the math uses.
     private struct RRWindowEntry {
@@ -206,6 +225,9 @@ class BluetoothManager: NSObject, ObservableObject {
 
     func disconnect() {
         userInitiatedDisconnect = true
+        if motionProbeInProgress {
+            finishMotionProbe(reason: "disconnect", sendStopCommand: true)
+        }
         cancelAutoHistoricalSync()
         if let peripheral = connectedPeripheral {
             centralManager.cancelPeripheralConnection(peripheral)
@@ -224,6 +246,117 @@ class BluetoothManager: NSObject, ObservableObject {
         let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
         logTX("REALTIME_HR_ON seq=\(seq)", tag: "CMD", hex: hexStr)
         writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    private func sendRawDataStart(to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
+        sendDebugCommand(name: "START_RAW_DATA", command: 81, payload: [1], to: peripheral, characteristic: characteristic)
+    }
+
+    private func sendRawDataStop(to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
+        sendDebugCommand(name: "STOP_RAW_DATA", command: 82, payload: [1], to: peripheral, characteristic: characteristic)
+    }
+
+    private func sendDebugCommand(
+        name: String,
+        command: UInt8,
+        payload: [UInt8],
+        to peripheral: CBPeripheral,
+        characteristic: CBCharacteristic
+    ) {
+        let seq = nextSequence
+        nextSequence &+= 1
+        let frame = Self.buildV5CommandFrame(sequence: seq, command: command, data: payload)
+        let hexStr = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
+        logTX("\(name) seq=\(seq)", tag: "MOTION", hex: hexStr)
+        writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    func startMotionProbe(seconds: TimeInterval? = nil) {
+        guard isAuthenticated,
+              let peripheral = connectedPeripheral,
+              let characteristic = commandCharacteristic else {
+            logWarn("Motion probe ignored — not authenticated", tag: "MOTION")
+            return
+        }
+        guard !motionProbeInProgress else {
+            logWarn("Motion probe already running — ignoring tap", tag: "MOTION")
+            return
+        }
+
+        let requestedSeconds = seconds ?? Self.motionProbeDefaultSeconds
+        let duration = min(max(requestedSeconds, 5), 60)
+        motionProbeInProgress = true
+        motionProbeFrames = 0
+        motionProbeTypeCounts.removeAll()
+        motionProbeKCounts.removeAll()
+        motionProbeRawFrameCount = 0
+        motionProbePostStopRawFrames = 0
+        motionProbeCandidateLogs = 0
+        motionProbeFirstFrameLogged = false
+        motionProbeRejectedCandidateCount = 0
+        motionProbeStartedAt = Date()
+        motionProbeStopWorkItem?.cancel()
+        motionProbeStopVerificationWorkItem?.cancel()
+        motionProbeStopVerificationWorkItem = nil
+
+        logInfo("Motion probe started for \(Int(duration))s — no samples will be persisted", tag: "MOTION")
+        sendRawDataStart(to: peripheral, characteristic: characteristic)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finishMotionProbe(reason: "timer", sendStopCommand: true)
+        }
+        motionProbeStopWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: workItem)
+    }
+
+    func stopMotionProbe() {
+        finishMotionProbe(reason: "manual", sendStopCommand: true)
+    }
+
+    private func finishMotionProbe(reason: String, sendStopCommand: Bool) {
+        guard motionProbeInProgress else { return }
+        motionProbeStopWorkItem?.cancel()
+        motionProbeStopWorkItem = nil
+
+        if sendStopCommand,
+           let peripheral = connectedPeripheral,
+           let characteristic = commandCharacteristic {
+            sendRawDataStop(to: peripheral, characteristic: characteristic)
+            startMotionProbeStopVerification()
+        }
+
+        let elapsed = motionProbeStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        let typeSummary = motionProbeTypeCounts
+            .sorted { $0.key < $1.key }
+            .map { "0x\(String(format: "%02x", $0.key)):\($0.value)" }
+            .joined(separator: " ")
+        let kSummary = motionProbeKCounts
+            .sorted { $0.key < $1.key }
+            .map { "K\($0.key):\($0.value)" }
+            .joined(separator: " ")
+        let kText = kSummary.isEmpty ? "none" : kSummary
+        let typeText = typeSummary.isEmpty ? "none" : typeSummary
+        logOK("Motion probe complete (\(reason)) — \(motionProbeFrames) frames in \(String(format: "%.1f", elapsed))s; types \(typeText); historical \(kText); raw43 \(motionProbeRawFrameCount); rejected \(motionProbeRejectedCandidateCount)", tag: "MOTION")
+
+        motionProbeInProgress = false
+        motionProbeStartedAt = nil
+    }
+
+    private func startMotionProbeStopVerification() {
+        motionProbePostStopRawFrames = 0
+        motionProbeStopVerificationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let frames = self.motionProbePostStopRawFrames
+            if frames == 0 {
+                self.logOK("STOP_RAW_DATA verified — no Raw43 frames for \(Int(Self.motionProbeStopVerificationSeconds))s", tag: "MOTION")
+            } else {
+                self.logWarn("STOP_RAW_DATA may still be active — \(frames) Raw43 frame\(frames == 1 ? "" : "s") after stop", tag: "MOTION")
+            }
+            self.motionProbeStopVerificationWorkItem = nil
+        }
+        motionProbeStopVerificationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.motionProbeStopVerificationSeconds, execute: workItem)
     }
 
     // Exit High Frequency History Sync: command 97 with empty payload
@@ -707,6 +840,12 @@ extension BluetoothManager: CBCentralManagerDelegate {
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         cancelAutoHistoricalSync()
+        motionProbeStopWorkItem?.cancel()
+        motionProbeStopWorkItem = nil
+        motionProbeStopVerificationWorkItem?.cancel()
+        motionProbeStopVerificationWorkItem = nil
+        motionProbeInProgress = false
+        motionProbeStartedAt = nil
         isAuthenticated = false
         commandCharacteristic = nil
 
@@ -721,6 +860,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         batteryLevel = nil
 
         rrWindow.removeAll()
+        rrSessionSamples = 0
         currentHRV = nil
         lastHRVUpdate = nil
         lastRRReceivedAt = nil
@@ -898,12 +1038,21 @@ extension BluetoothManager: CBPeripheralDelegate {
         let frame = complete.bytes
         let payload = Array(frame[8..<(frame.count - 4)])
         guard let packetType = payload.first else { return }
+        observeMotionProbeFrame(
+            frame: frame,
+            payload: payload,
+            packetType: packetType,
+            characteristic: characteristic,
+            chunkCount: complete.chunkCount
+        )
 
         switch packetType {
         case 0x24:
             handleCommandResponse(payload: payload, peripheral: peripheral)
         case 0x28:
             handleRealtimeHR(frame: frame, peripheral: peripheral)
+        case 0x2B:
+            handleRealtimeRawMotion(payload: payload)
         case 0x2F:
             // HISTORICAL_DATA — payload[1] is the K-value (typically 18 on Gen5).
             let k = payload.count > 1 ? payload[1] : 0
@@ -943,6 +1092,66 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
     }
 
+    private func handleRealtimeRawMotion(payload: [UInt8]) {
+        guard let accel = Self.parseGen5RawAccelPayload(payload) else { return }
+        persistMotionSample(accel)
+    }
+
+    private func observeMotionProbeFrame(
+        frame: Data,
+        payload: [UInt8],
+        packetType: UInt8,
+        characteristic: CBCharacteristic,
+        chunkCount: Int
+    ) {
+        if !motionProbeInProgress, packetType == 0x2B, motionProbeStopVerificationWorkItem != nil {
+            motionProbePostStopRawFrames += 1
+        }
+
+        guard motionProbeInProgress else { return }
+
+        motionProbeFrames += 1
+        motionProbeTypeCounts[packetType, default: 0] += 1
+
+        let k = payload.count > 1 ? payload[1] : nil
+        if packetType == 0x2F, let k, k == 20 || k == 21 {
+            motionProbeKCounts[k, default: 0] += 1
+        }
+
+        let isMotionDataFrame = packetType == 0x2B || (packetType == 0x2F && k.map { $0 == 20 || $0 == 21 } == true)
+        if isMotionDataFrame, !motionProbeFirstFrameLogged {
+            motionProbeFirstFrameLogged = true
+            let kText = k.map { " K=\($0)" } ?? ""
+            let hex = frame.map { String(format: "%02x", $0) }.joined(separator: " ")
+            logRX("Motion first frame type=0x\(String(format: "%02x", packetType))\(kText) len=\(frame.count) chunks=\(chunkCount) char=\(shortTag(characteristic.uuid))", tag: "MOTION", hex: hex)
+        }
+
+        switch packetType {
+        case 0x2B:
+            motionProbeRawFrameCount += 1
+            if let accel = Self.parseGen5RawAccelPayload(payload) {
+                logMotionProbeCandidate(accel.debugSummary)
+            } else {
+                motionProbeRejectedCandidateCount += 1
+            }
+        case 0x2F:
+            guard let k, k == 20 || k == 21 else { return }
+            if let summary = Self.classifyHistoricalGravityPayload(payload) {
+                logMotionProbeCandidate("HIST K\(k) \(summary)")
+            } else {
+                motionProbeRejectedCandidateCount += 1
+            }
+        default:
+            break
+        }
+    }
+
+    private func logMotionProbeCandidate(_ summary: String) {
+        guard motionProbeCandidateLogs < Self.motionProbeMaxCandidateLogs else { return }
+        motionProbeCandidateLogs += 1
+        logRX(summary, tag: "MOTION")
+    }
+
     private func handleCommandResponse(payload: [UInt8], peripheral: CBPeripheral) {
         guard payload.count >= 5 else { return }
         let respondedCmd = payload[2]
@@ -963,6 +1172,9 @@ extension BluetoothManager: CBPeripheralDelegate {
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.sendRealtimeHROn(to: peripheral, characteristic: cmd)
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                self?.sendRawDataStart(to: peripheral, characteristic: cmd)
             }
             scheduleAutoHistoricalSync(for: peripheral)
             return
@@ -1062,6 +1274,201 @@ extension BluetoothManager: CBPeripheralDelegate {
         return V5RealtimeData(k: k, sequence: sequence, hr: hr, rrIntervalsMS: rr, bodyHex: bodyHex)
     }
 
+    struct MotionAxisSummary {
+        let meanG: Double
+        let minG: Double
+        let maxG: Double
+    }
+
+    struct Gen5RawAccelFrame {
+        let k: UInt8
+        let subtype: UInt8
+        let recordHeader: UInt32
+        let deviceTimestamp: UInt32
+        let subseconds: UInt16
+        let sampleCount: Int
+        let x: MotionAxisSummary
+        let y: MotionAxisSummary
+        let z: MotionAxisSummary
+        let rmsDeviationG: Double
+        let meanDeltaG: Double
+        let maxDeltaG: Double
+
+        var wallClockEstimate: Date {
+            Date(timeIntervalSince1970: TimeInterval(deviceTimestamp) + TimeInterval(subseconds) / 32768.0)
+        }
+
+        var magnitudeG: Double {
+            (x.meanG * x.meanG + y.meanG * y.meanG + z.meanG * z.meanG).squareRoot()
+        }
+
+        var debugSummary: String {
+            let ts = DateFormatter.localizedString(from: wallClockEstimate, dateStyle: .none, timeStyle: .medium)
+            return "Raw43 Gen5 accel K\(k) sub=0x\(String(format: "%02x", subtype)) ts=\(ts) n=\(sampleCount) mean/range g x=\(Self.formatAxis(x)) y=\(Self.formatAxis(y)) z=\(Self.formatAxis(z)) |g|=\(BluetoothManager.formatMotion(magnitudeG)) rms=\(BluetoothManager.formatMotion(rmsDeviationG)) delta=\(BluetoothManager.formatMotion(meanDeltaG))"
+        }
+
+        private static func formatAxis(_ axis: MotionAxisSummary) -> String {
+            "\(BluetoothManager.formatMotion(axis.meanG))[\(BluetoothManager.formatMotion(axis.minG))...\(BluetoothManager.formatMotion(axis.maxG))]"
+        }
+    }
+
+    private static func parseGen5RawAccelPayload(_ payload: [UInt8]) -> Gen5RawAccelFrame? {
+        guard payload.first == 0x2B else { return nil }
+        guard payload.count >= 620 else { return nil }
+
+        // Observed on WHOOP 5.0 raw type-43/K21 frames: three contiguous
+        // 100-sample signed i16 accel blocks, scaled by 1/4096 g. This mirrors
+        // Noop's Gen4 scale, but the offsets are Gen5 payload-relative.
+        guard let xSamples = u16LE(payload, offset: 14),
+              let ySamples = u16LE(payload, offset: 16),
+              let axisCount = u16LE(payload, offset: 18),
+              xSamples == 100,
+              ySamples == 100,
+              axisCount == 3 else {
+            return nil
+        }
+
+        let sampleCount = Int(xSamples)
+        let accelScale = 1.0 / 4096.0
+        guard let xValues = axisValues(payload, offset: 20, count: sampleCount, scale: accelScale),
+              let yValues = axisValues(payload, offset: 220, count: sampleCount, scale: accelScale),
+              let zValues = axisValues(payload, offset: 420, count: sampleCount, scale: accelScale),
+              let recordHeader = u32LE(payload, offset: 3),
+              let deviceTimestamp = u32LE(payload, offset: 7),
+              let subseconds = u16LE(payload, offset: 11) else {
+            return nil
+        }
+        let x = axisSummary(xValues)
+        let y = axisSummary(yValues)
+        let z = axisSummary(zValues)
+        let motion = motionSummary(x: xValues, y: yValues, z: zValues, meanX: x.meanG, meanY: y.meanG, meanZ: z.meanG)
+
+        let frame = Gen5RawAccelFrame(
+            k: payload[1],
+            subtype: payload[2],
+            recordHeader: recordHeader,
+            deviceTimestamp: deviceTimestamp,
+            subseconds: subseconds,
+            sampleCount: sampleCount,
+            x: x,
+            y: y,
+            z: z,
+            rmsDeviationG: motion.rmsDeviationG,
+            meanDeltaG: motion.meanDeltaG,
+            maxDeltaG: motion.maxDeltaG
+        )
+        guard (0.8...1.2).contains(frame.magnitudeG) else { return nil }
+        return frame
+    }
+
+    private static func classifyHistoricalGravityPayload(_ payload: [UInt8]) -> String? {
+        guard payload.first == 0x2F else { return nil }
+        guard let x = f32LE(payload, offset: 36),
+              let y = f32LE(payload, offset: 40),
+              let z = f32LE(payload, offset: 44) else {
+            return nil
+        }
+        let magnitude = (x * x + y * y + z * z).squareRoot()
+        guard x.isFinite, y.isFinite, z.isFinite, magnitude.isFinite else { return nil }
+        guard (0.8...1.2).contains(magnitude) else { return nil }
+        return "v24 gravity candidate x=\(formatMotion(x)) y=\(formatMotion(y)) z=\(formatMotion(z)) |g|=\(formatMotion(magnitude))"
+    }
+
+    private static func i16Block(_ bytes: [UInt8], offset: Int, count: Int) -> [Int] {
+        var out: [Int] = []
+        out.reserveCapacity(count)
+        for i in 0..<count {
+            let o = offset + i * 2
+            guard let value = i16LE(bytes, offset: o) else { break }
+            out.append(Int(value))
+        }
+        return out
+    }
+
+    private static func axisValues(_ bytes: [UInt8], offset: Int, count: Int, scale: Double) -> [Double]? {
+        let raw = i16Block(bytes, offset: offset, count: count)
+        guard raw.count == count else { return nil }
+        return raw.map { Double($0) * scale }
+    }
+
+    private static func axisSummary(_ values: [Double]) -> MotionAxisSummary {
+        let mean = values.reduce(0, +) / Double(values.count)
+        return MotionAxisSummary(
+            meanG: mean,
+            minG: values.min() ?? 0,
+            maxG: values.max() ?? 0
+        )
+    }
+
+    private static func motionSummary(
+        x: [Double],
+        y: [Double],
+        z: [Double],
+        meanX: Double,
+        meanY: Double,
+        meanZ: Double
+    ) -> (rmsDeviationG: Double, meanDeltaG: Double, maxDeltaG: Double) {
+        guard x.count == y.count, y.count == z.count, !x.isEmpty else {
+            return (0, 0, 0)
+        }
+
+        var squaredDeviationSum = 0.0
+        var deltaSum = 0.0
+        var maxDelta = 0.0
+
+        for i in x.indices {
+            let dx = x[i] - meanX
+            let dy = y[i] - meanY
+            let dz = z[i] - meanZ
+            squaredDeviationSum += dx * dx + dy * dy + dz * dz
+
+            if i > x.startIndex {
+                let stepX = x[i] - x[i - 1]
+                let stepY = y[i] - y[i - 1]
+                let stepZ = z[i] - z[i - 1]
+                let delta = (stepX * stepX + stepY * stepY + stepZ * stepZ).squareRoot()
+                deltaSum += delta
+                maxDelta = max(maxDelta, delta)
+            }
+        }
+
+        let rms = (squaredDeviationSum / Double(x.count)).squareRoot()
+        let meanDelta = x.count > 1 ? deltaSum / Double(x.count - 1) : 0
+        return (rms, meanDelta, maxDelta)
+    }
+
+    private static func i16LE(_ bytes: [UInt8], offset: Int) -> Int16? {
+        guard offset + 1 < bytes.count else { return nil }
+        let raw = UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+        return Int16(bitPattern: raw)
+    }
+
+    private static func u16LE(_ bytes: [UInt8], offset: Int) -> UInt16? {
+        guard offset + 1 < bytes.count else { return nil }
+        return UInt16(bytes[offset]) | UInt16(bytes[offset + 1]) << 8
+    }
+
+    private static func u32LE(_ bytes: [UInt8], offset: Int) -> UInt32? {
+        guard offset + 3 < bytes.count else { return nil }
+        return UInt32(bytes[offset])
+            | UInt32(bytes[offset + 1]) << 8
+            | UInt32(bytes[offset + 2]) << 16
+            | UInt32(bytes[offset + 3]) << 24
+    }
+
+    private static func f32LE(_ bytes: [UInt8], offset: Int) -> Double? {
+        guard offset + 3 < bytes.count else { return nil }
+        let raw = UInt32(bytes[offset])
+            | UInt32(bytes[offset + 1]) << 8
+            | UInt32(bytes[offset + 2]) << 16
+            | UInt32(bytes[offset + 3]) << 24
+        return Double(Float(bitPattern: raw))
+    }
+
+    private static func formatMotion(_ value: Double) -> String {
+        String(format: "%.3f", value)
+    }
+
     // Persist one HR sample to SwiftData. The main context autosaves, so we
     // just insert; we don't `save()` per-call. Retention is "forever" — no
     // trimming. If storage ever feels heavy, switch to hourly roll-ups for
@@ -1071,6 +1478,28 @@ extension BluetoothManager: CBPeripheralDelegate {
         modelContext.insert(HRSample(timestamp: now, bpm: bpm))
         updateDailySummary(bpm: bpm)
         updateHourlySummary(bpm: bpm, at: now)
+    }
+
+    private func persistMotionSample(_ frame: Gen5RawAccelFrame) {
+        let timestamp = frame.wallClockEstimate
+        modelContext.insert(MotionSample(
+            timestamp: timestamp,
+            sampleCount: frame.sampleCount,
+            meanXG: frame.x.meanG,
+            meanYG: frame.y.meanG,
+            meanZG: frame.z.meanG,
+            magnitudeG: frame.magnitudeG,
+            minXG: frame.x.minG,
+            maxXG: frame.x.maxG,
+            minYG: frame.y.minG,
+            maxYG: frame.y.maxG,
+            minZG: frame.z.minG,
+            maxZG: frame.z.maxG,
+            rmsDeviationG: frame.rmsDeviationG,
+            meanDeltaG: frame.meanDeltaG,
+            maxDeltaG: frame.maxDeltaG,
+            sourceKey: "raw43:\(frame.deviceTimestamp):\(frame.subseconds):\(frame.recordHeader)"
+        ))
     }
 
     // MARK: - Summary aggregation
@@ -1247,6 +1676,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         for ms in intervals {
             guard ms >= Self.rrIntervalMinMS, ms <= Self.rrIntervalMaxMS else { continue }
             rrWindow.append(RRWindowEntry(timestamp: now, intervalMS: ms))
+            rrSessionSamples += 1
             // Persist the raw R-R interval — sparse and cheap.
             modelContext.insert(RRSample(timestamp: now, intervalMS: ms))
         }
