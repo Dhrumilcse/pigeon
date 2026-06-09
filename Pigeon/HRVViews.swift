@@ -149,12 +149,12 @@ struct HRVDetailView: View {
 // low/high. List virtualization keeps it cheap.
 struct ShowAllHRVDataView: View {
     @State private var range: HealthTimeRange = .day
-    @Query(
-        filter: #Predicate<DailySummary> { $0.hrvSampleCount > 0 },
-        sort: \.date,
-        order: .reverse
-    )
-    private var days: [DailySummary]
+    @Environment(\.modelContext) private var modelContext
+    @State private var days: [DailySummary] = []
+    @State private var hasMoreDays = true
+    @State private var isLoadingDays = false
+
+    private let dayPageSize = 50
 
     var body: some View {
         ScrollView {
@@ -185,7 +185,21 @@ struct ShowAllHRVDataView: View {
                             }
                         }
                         .buttonStyle(.plain)
+                        .onAppear {
+                            if day.persistentModelID == days.last?.persistentModelID {
+                                loadMoreDays()
+                            }
+                        }
                     }
+                }
+
+                if hasMoreDays {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                    .padding(.vertical, 8)
                 }
             }
             .padding(.horizontal, Layout.screenHMargin)
@@ -194,6 +208,32 @@ struct ShowAllHRVDataView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("All Recorded Data")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if days.isEmpty && hasMoreDays {
+                loadMoreDays()
+            }
+        }
+    }
+
+    private func loadMoreDays() {
+        guard !isLoadingDays, hasMoreDays else { return }
+        isLoadingDays = true
+        defer { isLoadingDays = false }
+
+        let cursor = days.last?.date ?? Date.distantFuture
+        var descriptor = FetchDescriptor<DailySummary>(
+            predicate: #Predicate<DailySummary> { $0.hrvSampleCount > 0 && $0.date < cursor },
+            sortBy: [SortDescriptor(\.date, order: .reverse)]
+        )
+        descriptor.fetchLimit = dayPageSize
+
+        do {
+            let page = try modelContext.fetch(descriptor)
+            days.append(contentsOf: page)
+            hasMoreDays = page.count == dayPageSize
+        } catch {
+            hasMoreDays = false
+        }
     }
 }
 
@@ -374,22 +414,58 @@ private struct MonthlyHRVAllDataCard: View {
 
 private struct HRVDayRow: View {
     let dayStart: Date
-    @Query private var samples: [HRVSample]
-
-    init(dayStart: Date) {
-        self.dayStart = dayStart
-        let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
-        _samples = Query(
-            filter: #Predicate<HRVSample> { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
-            sort: \.timestamp
-        )
-    }
+    @Environment(\.modelContext) private var modelContext
+    @State private var bounds: (low: Int, high: Int)?
+    @State private var hasLoadedBounds = false
 
     var body: some View {
-        let values = samples.map(\.rmssdMS)
-        let low = Int((values.min() ?? 0).rounded())
-        let high = Int((values.max() ?? 0).rounded())
-        HealthDaySummaryRow(low: low, high: high, unit: "ms", date: dayStart)
+        Group {
+            if let bounds {
+                HealthDaySummaryRow(low: bounds.low, high: bounds.high, unit: "ms", date: dayStart)
+            } else {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("—")
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Text(dayStart.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year()))
+                        .font(.system(size: 15))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .task {
+            loadBoundsIfNeeded()
+        }
+    }
+
+    private func loadBoundsIfNeeded() {
+        guard !hasLoadedBounds else { return }
+        hasLoadedBounds = true
+
+        let start = dayStart
+        let end = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+
+        var lowDescriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.rmssdMS)]
+        )
+        lowDescriptor.fetchLimit = 1
+
+        var highDescriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.rmssdMS, order: .reverse)]
+        )
+        highDescriptor.fetchLimit = 1
+
+        guard let low = try? modelContext.fetch(lowDescriptor).first,
+              let high = try? modelContext.fetch(highDescriptor).first else {
+            return
+        }
+        bounds = (
+            low: Int(low.rmssdMS.rounded()),
+            high: Int(high.rmssdMS.rounded())
+        )
     }
 }
 

@@ -34,6 +34,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var isAuthenticated = false
     private var hasAttemptedAutoReconnect = false
     private var userInitiatedDisconnect = false
+    private var autoHistoricalSyncWorkItem: DispatchWorkItem?
 
     // V5 frame reassembly state, keyed by characteristic. iOS notifications are
     // MTU-capped (~244 B), so long frames like the K21 raw-motion stream arrive
@@ -103,6 +104,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var historicalIdleTimer: DispatchWorkItem?
     private static let historicalSaveChunkSize = 500
     private static let historicalIdleSeconds: TimeInterval = 3
+    private static let autoHistoricalSyncDelay: TimeInterval = 1.5
     private static let lastHistoricalSyncKey = "pigeon.lastHistoricalSyncAt"
 
     // Step 2a — dump one K=18 body hex per drain so we can keep eyeballing
@@ -204,6 +206,7 @@ class BluetoothManager: NSObject, ObservableObject {
 
     func disconnect() {
         userInitiatedDisconnect = true
+        cancelAutoHistoricalSync()
         if let peripheral = connectedPeripheral {
             centralManager.cancelPeripheralConnection(peripheral)
         }
@@ -266,6 +269,28 @@ class BluetoothManager: NSObject, ObservableObject {
         historicalIdleTimer = nil
         awaitingFirstK18Dump = true
         writeCommand(frame, to: peripheral, characteristic: characteristic)
+    }
+
+    private func scheduleAutoHistoricalSync(for peripheral: CBPeripheral) {
+        cancelAutoHistoricalSync()
+        let peripheralID = peripheral.identifier
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.autoHistoricalSyncWorkItem = nil
+            guard self.connectedPeripheral?.identifier == peripheralID,
+                  self.connectionState == .connected,
+                  self.isAuthenticated else {
+                return
+            }
+            self.sendHistoricalSync()
+        }
+        autoHistoricalSyncWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.autoHistoricalSyncDelay, execute: workItem)
+    }
+
+    private func cancelAutoHistoricalSync() {
+        autoHistoricalSyncWorkItem?.cancel()
+        autoHistoricalSyncWorkItem = nil
     }
 
     // Step 2a — dump the first K=18 payload of a drain so we can verify the
@@ -583,6 +608,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
 
         if central.state != .poweredOn {
             isScanning = false
+            cancelAutoHistoricalSync()
             connectionState = .disconnected
             return
         }
@@ -674,11 +700,13 @@ extension BluetoothManager: CBCentralManagerDelegate {
     }
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        cancelAutoHistoricalSync()
         connectionState = .disconnected
         connectedDevice = nil
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        cancelAutoHistoricalSync()
         isAuthenticated = false
         commandCharacteristic = nil
 
@@ -936,6 +964,7 @@ extension BluetoothManager: CBPeripheralDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
                 self?.sendRealtimeHROn(to: peripheral, characteristic: cmd)
             }
+            scheduleAutoHistoricalSync(for: peripheral)
             return
         }
 
