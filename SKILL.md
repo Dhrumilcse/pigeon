@@ -16,7 +16,7 @@ You're working on an iOS app that talks to a WHOOP 5.0 strap over BLE, persists 
 - **State restoration** — `CBCentralManager` initialized with `CBCentralManagerOptionRestoreIdentifierKey: "pigeon.central"`. `centralManager(_:willRestoreState:)` re-attaches the delegate to restored peripherals and re-runs service discovery so the auth + realtime sequence flows again.
 - **Standard public services** — `0x180A` device info (manufacturer, model, serial, FW, HW) + `0x180F` battery surfaced on the General / Battery pages.
 - **Typed debug log** (`DebugLogEntry`) with `info/ok/tx/rx/warn/err` levels, tags, optional hex, filter chips (`All / Transmit / Receive / Errors`), RR status banner, share-as-text. Entries are emitted via `logInfo / logOK / logTX / logRX / logWarn / logError`.
-- **Charts (Apple-Health-style)** — Settings → Samples → Heart Rate / Heart Rate Variability. Segmented picker for `30m / 1h / 4h / 8h / 1d / 4d`. Y-axis on trailing edge, X-axis hidden, fixed-width red/purple bars. Home also has a Motion card + detail page powered by `MotionSample`. `@Query` with a `#Predicate<Sample>` on timestamp powers each chart.
+- **Charts (Apple-Health-style)** — Home → Heart Rate / Heart Rate Variability / Motion cards open the main data detail pages. HR + HRV use `D / W / M / 6M / Y` range filters backed by hourly/daily/monthly summaries, with Show All Data drilldowns into raw samples. Motion is powered by `MotionSample`.
 
 ## File map
 
@@ -25,7 +25,7 @@ You're working on an iOS app that talks to a WHOOP 5.0 strap over BLE, persists 
 | `PigeonApp.swift`          | App entry; creates the `ModelContainer` for sample/summary models and attaches it via `.modelContainer(...)` |
 | `ContentView.swift`        | TabView shell; receives the `ModelContainer` and injects it into `BluetoothManager`'s init                    |
 | `HomeView.swift`           | Live HR readout + HR / HRV / Motion cards and detail views                                                    |
-| `SettingsView.swift`       | WHOOP card → detail, General, Battery, Samples (HR + HRV charts), Debug                                       |
+| `SettingsView.swift`       | WHOOP card → detail, General, Battery, Calculations explainers, Local Storage, Debug                          |
 | `BluetoothManager.swift`   | BLE state machine, V5 framing + parsing + reassembly, CRC, HRV math, SwiftData inserts, state-restoration delegate, typed debug log |
 | `Models.swift`             | SwiftData `@Model` classes: `HRSample`, `RRSample`, `HRVSample`, `MotionSample`, summaries                    |
 | `WhoopIdentification.swift`| WHOOP service UUIDs + name/advertisement helpers                                                              |
@@ -140,15 +140,15 @@ Settings
 ├── WHOOP card  (NavigationLink → WhoopDetailView with scan/disconnect)
 ├── General     (NavigationLink → device info from 0x180A)
 ├── Battery     (NavigationLink → battery level from 0x180F)
-├── Samples     (NavigationLink → SamplesListView)
-│     ├── Heart Rate                (→ HeartRateChartView, red bars)
-│     └── Heart Rate Variability    (→ HRVChartView, purple bars)
+├── Calculations
+│     ├── Heart Rate                (→ HeartRateAboutView)
+│     └── Heart Rate Variability    (→ HRVAboutView)
 ├── Local Storage
 │     └── MotionSample              (compact Raw43 accel aggregate rows)
 └── Debug       (NavigationLink → typed log with filter + share)
 ```
 
-Apple-Settings vocabulary: colored rounded-square icons (`gearshape.fill` gray, `battery.100` green, `chart.bar.fill` pink, `hammer.fill` gray, `heart.fill` red, `waveform.path.ecg` purple), `.insetGrouped` lists, destructive actions live on detail pages.
+Apple-Settings vocabulary: colored rounded-square icons (`gearshape.fill` gray, `battery.100` green, `hammer.fill` gray, `heart.fill` red, `waveform.path.ecg` purple, `cylinder.split.1x2` blue), `.insetGrouped` lists, destructive actions live on detail pages.
 
 Chart views follow this pattern: outer view owns the segmented `Picker` for the range; inner `*ChartBody` view holds the `@Query` (initialized from `range.seconds`), and the outer wraps `.id(range)` to force re-init when the picker changes. Motion detail buckets `MotionSample.meanDeltaG` to keep overnight / multi-day charts readable.
 

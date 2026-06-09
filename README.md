@@ -18,8 +18,7 @@ A minimal iOS app that reads live data from a WHOOP 5.0 strap over BLE — inclu
 - Persists every HR / RR / HRV sample plus compact motion aggregates to SwiftData with retention = forever.
 - Stays connected while the app is backgrounded (`UIBackgroundModes: bluetooth-central`) and survives force-quit via CoreBluetooth state restoration.
 - Reads standard `0x180A` Device Information + `0x180F` Battery for the General / Battery pages.
-- Shows a Motion home card + detail page for overnight stillness/movement from motion aggregates. The detail chart uses `D / W / M` range filters with Health-style x-axis ticks.
-- Renders bar charts (HR + HRV) under Settings → Samples with a segmented `30m / 1h / 4h / 8h / 1d / 4d` range picker.
+- Shows HR / HRV / Motion home cards that open main data detail pages with Health-style charts and range filters.
 - Categorized debug log (TX / RX / OK / INFO / WARN / ERR) with filter chips and share-as-text.
 
 ## WHOOP BLE protocol notes (what we found)
@@ -185,7 +184,7 @@ Pigeon/
 ├── PigeonApp.swift           SwiftUI app entry; owns the ModelContainer
 ├── ContentView.swift         TabView shell (Home + Settings); injects container into BluetoothManager
 ├── HomeView.swift            Live HR readout + HR / HRV / Motion cards and detail views
-├── SettingsView.swift        WHOOP card → detail / General / Battery / Samples (HR + HRV charts) / Debug
+├── SettingsView.swift        WHOOP card → detail / General / Battery / Calculations / Local Storage / Debug
 ├── BluetoothManager.swift    BLE state machine, V5 framing/parsing/reassembly, CRC, HRV math, SwiftData inserts, state-restoration delegate, typed debug log
 ├── Models.swift              SwiftData @Model classes: HRSample, RRSample, HRVSample, MotionSample
 └── WhoopIdentification.swift Helpers for recognising a WHOOP device
