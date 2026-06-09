@@ -33,6 +33,12 @@ struct SettingsView: View {
 
                 Section("Calculations") {
                     NavigationLink {
+                        HeartRateAboutView()
+                    } label: {
+                        SettingsRow(icon: "heart.fill", iconColor: .red, title: "Heart Rate")
+                    }
+
+                    NavigationLink {
                         HRVAboutView()
                     } label: {
                         SettingsRow(icon: "waveform.path.ecg", iconColor: .purple, title: "Heart Rate Variability")
@@ -1029,6 +1035,46 @@ private struct MonthlyHRChartBody: View {
         guard !withData.isEmpty else { return "—" }
         let avg = withData.map(\.avgHR).reduce(0, +) / Double(withData.count)
         return "\(Int(avg.rounded()))"
+    }
+}
+
+// MARK: - About Heart Rate
+
+struct HeartRateAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Heart Rate")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Heart rate is the number of times your heart beats per minute, shown as BPM. It rises and falls throughout the day as your body responds to movement, recovery, stress, sleep, temperature, and hydration.")
+
+                    Text("Pigeon reads heart rate from the WHOOP realtime stream while the strap is connected. Each valid reading is saved as an HR sample, then rolled into hourly, daily, and monthly summaries for charts.")
+
+                    Text("The Sync History action can also import heart rate readings stored on the strap. Those historical readings help fill gaps from times when the app was not actively connected.")
+
+                    Text("Average heart rate is calculated from the samples in the selected time period. Short ranges use raw samples, while longer ranges use the precomputed summary rows so charts stay fast.")
+
+                    Text("Because wrist optical sensors estimate heart rate from blood-flow changes, readings can lag during sudden effort or be noisier when the strap is loose, moving, or not making consistent contact.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Heart Rate")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
