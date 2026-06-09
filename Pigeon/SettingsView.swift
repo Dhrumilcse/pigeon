@@ -401,9 +401,7 @@ struct DebugView: View {
             .padding(.vertical, 10)
             .background(Color(.systemGroupedBackground))
 
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                RRStatusBanner(bluetooth: bluetooth, now: context.date)
-            }
+            DebugMetricCards(bluetooth: bluetooth)
 
             List {
                 let entries = filteredEntries
@@ -476,62 +474,72 @@ struct DebugView: View {
     }
 }
 
-private struct RRStatusBanner: View {
+private struct DebugMetricCards: View {
     @ObservedObject var bluetooth: BluetoothManager
-    let now: Date
-
-    private static let rrFreshnessSeconds: TimeInterval = 5
-    private static let hrFreshnessSeconds: TimeInterval = 5
 
     var body: some View {
         HStack(spacing: 10) {
-            Circle()
-                .fill(dotColor)
-                .frame(width: 8, height: 8)
-            Text("RR")
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
-                .foregroundColor(.secondary)
-            Text(statusText)
-                .font(.system(size: 13))
-                .foregroundColor(.primary)
-            Spacer()
+            DebugMetricCard(icon: "waveform.path.ecg", value: "\(bluetooth.rrSessionSamples)", tint: .purple)
+                .accessibilityLabel("RR samples")
+                .accessibilityValue("\(bluetooth.rrSessionSamples)")
+
+            DebugMetricCard(icon: "clock.arrow.circlepath", value: "\(bluetooth.historicalSyncPackets)", tint: .blue)
+                .accessibilityLabel("Historical sync packets")
+                .accessibilityValue("\(bluetooth.historicalSyncPackets)")
+
+            Button {
+                bluetooth.startMotionProbe()
+            } label: {
+                DebugMetricCard(icon: "figure.walk.motion", value: "\(bluetooth.motionProbeFrames)", tint: .orange)
+            }
+            .buttonStyle(.plain)
+            .disabled(bluetooth.connectionState != .connected || bluetooth.motionProbeInProgress)
+            .accessibilityLabel("Motion probe frames")
+            .accessibilityValue("\(bluetooth.motionProbeFrames)")
+
+            Button {
+                bluetooth.stopMotionProbe()
+            } label: {
+                DebugMetricCard(icon: bluetooth.motionProbeInProgress ? "stop.fill" : nil, value: nil, tint: .red)
+            }
+            .buttonStyle(.plain)
+            .disabled(!bluetooth.motionProbeInProgress)
+            .accessibilityLabel("Stop motion probe")
         }
         .padding(.horizontal, Layout.screenHMargin)
-        .padding(.vertical, 8)
-        .background(Color(.secondarySystemGroupedBackground))
+        .padding(.bottom, 8)
+        .background(Color(.systemGroupedBackground))
     }
+}
 
-    private var rrAge: TimeInterval? {
-        bluetooth.lastRRReceivedAt.map { now.timeIntervalSince($0) }
-    }
+private struct DebugMetricCard: View {
+    let icon: String?
+    let value: String?
+    let tint: Color
 
-    private var hrAge: TimeInterval? {
-        bluetooth.lastHeartRateUpdate.map { now.timeIntervalSince($0) }
-    }
+    var body: some View {
+        VStack(spacing: 7) {
+            if let icon {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(tint)
+            }
 
-    private var dotColor: Color {
-        if let age = rrAge, age < Self.rrFreshnessSeconds { return .green }
-        if let age = hrAge, age < Self.hrFreshnessSeconds { return .orange }
-        return Color(.systemGray3)
-    }
-
-    private var statusText: String {
-        switch (rrAge, hrAge) {
-        case (let rr?, _) where rr < Self.rrFreshnessSeconds:
-            return "flowing"
-        case (let rr?, let hr?) where hr < Self.hrFreshnessSeconds:
-            return "gated by strap (last seen \(formatAge(rr)))"
-        case (nil, let hr?) where hr < Self.hrFreshnessSeconds:
-            return "gated by strap (no RR yet this session)"
-        case (_, nil), (_, _?):
-            return "waiting — no HR stream"
+            if let value {
+                Text(value)
+                    .font(.system(size: 18, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .monospacedDigit()
+            }
         }
-    }
-
-    private func formatAge(_ seconds: TimeInterval) -> String {
-        if seconds < 60 { return "\(Int(seconds))s ago" }
-        let m = Int(seconds / 60)
-        return "\(m)m ago"
+        .frame(maxWidth: .infinity)
+        .frame(height: 58)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
     }
 }
 

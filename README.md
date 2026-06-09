@@ -13,10 +13,12 @@ A minimal iOS app that reads live data from a WHOOP 5.0 strap over BLE — inclu
 - Drains the strap's buffered HR history on demand via a **Sync History** button in Settings → WHOOP — see *Historical sync* below.
 - Reassembles fragmented V5 frames on `fd4b0005` (long packets arrive as multiple 244 B BLE notifications).
 - Decodes K2 frames for heart rate + R-R intervals.
+- Starts the Raw43/K21 realtime accelerometer stream with `START_RAW_DATA` (cmd `0x51`) and decodes compact Gen5 motion aggregates.
 - Computes HRV (RMSSD) over a 60 s rolling window with ectopic-beat filtering.
-- Persists every HR / RR / HRV sample to SwiftData with retention = forever.
+- Persists every HR / RR / HRV sample plus compact motion aggregates to SwiftData with retention = forever.
 - Stays connected while the app is backgrounded (`UIBackgroundModes: bluetooth-central`) and survives force-quit via CoreBluetooth state restoration.
 - Reads standard `0x180A` Device Information + `0x180F` Battery for the General / Battery pages.
+- Shows a Motion home card + detail page for overnight stillness/movement from motion aggregates. The detail chart uses `D / W / M` range filters with Health-style x-axis ticks.
 - Renders bar charts (HR + HRV) under Settings → Samples with a segmented `30m / 1h / 4h / 8h / 1d / 4d` range picker.
 - Categorized debug log (TX / RX / OK / INFO / WARN / ERR) with filter chips and share-as-text.
 
@@ -53,7 +55,7 @@ Payload:
   byte n-4..n-1 CRC32 (IEEE 802.3) over the padded payload bytes
 ```
 
-Large frames (typical: 1244 B K21 raw motion, 2140 B K20) arrive as multiple ~244 B BLE notifications. Pigeon reassembles them into a single logical frame before dispatch. Realtime K2 (HR + RR) and command responses are always handled; `0x2F` HISTORICAL_DATA + `0x31` METADATA are handled only while a Sync History drain is in flight (see below). Other K-types (K=20, K=21 raw motion) are dropped.
+Large frames (typical: 1244 B Raw43/K21 motion, 2140 B K20) arrive as multiple ~244 B BLE notifications. Pigeon reassembles them into a single logical frame before dispatch. Realtime K2 (HR + RR), Raw43/K21 accelerometer, and command responses are always handled; `0x2F` HISTORICAL_DATA + `0x31` METADATA are handled only while a Sync History drain is in flight (see below). Historical K20/K21 pages are still logged but not decoded.
 
 ### Realtime HR stream (K2 frame)
 
@@ -72,6 +74,37 @@ Large frames (typical: 1244 B K21 raw motion, 2140 B K20) arrive as multiple ~24
 ```
 
 The strap's beat-detection runs through a **confidence gate in firmware** — when the optical signal is noisy (motion, slack contact), RR slots come through as zero. HR keeps streaming. WHOOP's own app reflects this by showing HRV only as a daily metric computed during sleep. Pigeon computes RMSSD opportunistically from whatever RR we get.
+
+### Realtime accelerometer stream (Raw43 / K21)
+
+After auth, Pigeon sends `START_RAW_DATA` (cmd `0x51`, payload `[1]`). On Gen5 firmware this enables `REALTIME_RAW_DATA` frames on `fd4b0005`:
+
+```
+[0]       0x2B  packet type (REALTIME_RAW_DATA / Raw43)
+[1]       0x15  K-value (K21)
+[2]       subtype / stream byte (observed 0x80 on accel frames)
+[3..6]    u32 LE record header
+[7..10]   u32 LE timestamp_seconds (unix epoch)
+[11..12]  u16 LE timestamp_subseconds (out of 32768)
+[14..15]  u16 LE x sample count (100)
+[16..17]  u16 LE y sample count (100)
+[18..19]  u16 LE axis count (3)
+[20..219]     100 x-axis i16 LE samples
+[220..419]    100 y-axis i16 LE samples
+[420..619]    100 z-axis i16 LE samples
+```
+
+Scale is `1 / 4096 g` per raw unit. A still strap should produce a mean vector magnitude near `1 g`:
+`sqrt(meanX² + meanY² + meanZ²) ≈ 1`.
+
+Pigeon does **not** persist all 300 raw axis samples. It folds each valid frame into one `MotionSample` row with:
+
+- mean/min/max per axis (`meanXG`, `minXG`, etc.)
+- `magnitudeG` for orientation sanity
+- `rmsDeviationG`, `meanDeltaG`, `maxDeltaG` for movement
+- `sourceKey = "raw43:<timestamp>:<subseconds>:<recordHeader>"`
+
+`TOGGLE_IMU_MODE` (cmd `0x6A`) was tried during discovery and returned `FAILURE`; `START_RAW_DATA` is sufficient for the observed Gen5 accelerometer stream. Debug still exposes a bounded Motion Probe and manual stop, but normal collection starts after auth.
 
 ### Historical sync (K=18)
 
@@ -104,7 +137,7 @@ A few empirical notes from running this:
 - **Realtime never pauses during the drain.** K2 frames keep flowing at ~1 Hz on the same characteristic alongside the K=18/20/21 burst — no need to disable realtime first.
 - **The strap's local buffer is small** (~1 hour observed on Gen5 firmware `50.38.1.0`). It's shared with the WHOOP official app: pages the WHOOP app ACKs are gone for Pigeon too. So Sync History catches what's accumulated since the last drain by either client — it does *not* backfill multi-day gaps.
 - **`HistoryComplete` (metadata `kind=3`) only arrives once every batch has been ACKed.** Before Pigeon was wired to ACK, kind=3 never appeared — the strap was stuck retransmitting kind=2.
-- **K=20 (2140 B) and K=21 (1244 B) are streamed during the same drain** but currently dropped. K=21 is raw IMU motion per Goose; K=20 is undecoded.
+- **Historical K=20 (2140 B) and K=21 (1244 B) are streamed during the same drain** but currently dropped. Realtime Raw43/K21 is decoded separately as accelerometer motion; historical K21 layout is not yet trusted as the same stream.
 
 ### Command IDs (Goose-derived)
 
@@ -114,11 +147,13 @@ A few empirical notes from running this:
 | 22   | SEND_HISTORICAL_DATA          | yes (Sync History button) |
 | 23   | HISTORICAL_DATA_RESULT (ACK)  | yes (one per HistoryEnd batch) |
 | 34   | GET_DATA_RANGE                | no |
+| 81   | START_RAW_DATA                | yes (after auth; enables Raw43/K21 accel) |
+| 82   | STOP_RAW_DATA                 | debug/manual Motion Probe stop |
 | 63   | SEND_R10_R11_REALTIME         | tried — UNSUPPORTED on Gen5 firmware `50.38.1.0` |
 | 91   | GET_HELLO (auth handshake)    | yes |
 | 96   | ENTER_HIGH_FREQ_SYNC          | no |
 | 97   | EXIT_HIGH_FREQ_SYNC           | yes (after auth, before realtime HR) |
-| 106  | TOGGLE_IMU_MODE               | no |
+| 106  | TOGGLE_IMU_MODE               | tried — FAILURE on Gen5; not needed for Raw43 accel |
 | 107  | ENABLE_OPTICAL_DATA           | no (candidate for R17 PPG / beat-by-beat HRV) |
 | 108  | TOGGLE_OPTICAL_MODE           | no |
 | 153  | TOGGLE_PERSISTENT_R20         | no |
@@ -128,11 +163,12 @@ Command-response result codes (per Goose): `0=FAILURE`, `1=SUCCESS`, `2=PENDING`
 
 ## Persistence
 
-SwiftData store, three `@Model` classes (`Pigeon/Models.swift`):
+SwiftData store, raw sample `@Model` classes (`Pigeon/Models.swift`):
 
 - `HRSample(timestamp, bpm, sourceKey?)` — written for every valid K2 HR (~1 Hz, `sourceKey` nil) and for every K=18 historical page (`sourceKey = "k18:<page>"`, used for dedup on re-sync).
 - `RRSample(timestamp, intervalMS)` — written for each filtered R-R interval (sparse).
 - `HRVSample(timestamp, rmssdMS)` — written each time RMSSD is computed.
+- `MotionSample(timestamp, sampleCount, mean/min/max X/Y/Z in g, magnitudeG, rmsDeviationG, meanDeltaG, maxDeltaG, sourceKey?)` — one compact aggregate per valid Raw43/K21 accelerometer frame.
 
 Retention is forever (no rolloff). Default location: `Application Support/default.store`. The charts use SwiftUI `@Query` with a `#Predicate<Sample> { $0.timestamp >= rangeStart }` so range changes re-fetch reactively.
 
@@ -148,10 +184,10 @@ Retention is forever (no rolloff). Default location: `Application Support/defaul
 Pigeon/
 ├── PigeonApp.swift           SwiftUI app entry; owns the ModelContainer
 ├── ContentView.swift         TabView shell (Home + Settings); injects container into BluetoothManager
-├── HomeView.swift            Live HR readout + HRV / Battery metric cards
+├── HomeView.swift            Live HR readout + HR / HRV / Motion cards and detail views
 ├── SettingsView.swift        WHOOP card → detail / General / Battery / Samples (HR + HRV charts) / Debug
 ├── BluetoothManager.swift    BLE state machine, V5 framing/parsing/reassembly, CRC, HRV math, SwiftData inserts, state-restoration delegate, typed debug log
-├── Models.swift              SwiftData @Model classes: HRSample, RRSample, HRVSample
+├── Models.swift              SwiftData @Model classes: HRSample, RRSample, HRVSample, MotionSample
 └── WhoopIdentification.swift Helpers for recognising a WHOOP device
 ```
 
