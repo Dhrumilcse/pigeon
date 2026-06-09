@@ -78,6 +78,44 @@ final class MonthlySummary {
     }
 }
 
+enum MotionStillness {
+    static let meanDeltaThresholdG = 0.03
+    static let rmsThresholdG = 0.08
+
+    static func isStill(meanDeltaG: Double, rmsDeviationG: Double) -> Bool {
+        meanDeltaG < meanDeltaThresholdG && rmsDeviationG < rmsThresholdG
+    }
+}
+
+// Pre-aggregated motion summary. One row per bucket resolution so charts read
+// a small, fixed number of rows instead of scanning raw MotionSample history.
+@Model
+final class MotionBucketSummary {
+    var bucketStart: Date
+    var bucketSeconds: Int
+    var sampleCount: Int
+    var stillCount: Int
+    var sumMeanDeltaG: Double
+    var maxDeltaG: Double
+    var firstSampleAt: Date?
+    var lastSampleAt: Date?
+
+    var avgMeanDeltaG: Double {
+        sampleCount > 0 ? sumMeanDeltaG / Double(sampleCount) : 0
+    }
+
+    init(bucketStart: Date, bucketSeconds: Int) {
+        self.bucketStart = bucketStart
+        self.bucketSeconds = bucketSeconds
+        self.sampleCount = 0
+        self.stillCount = 0
+        self.sumMeanDeltaG = 0
+        self.maxDeltaG = 0
+        self.firstSampleAt = nil
+        self.lastSampleAt = nil
+    }
+}
+
 // One heart-rate reading from the WHOOP strap. Written at ~1 Hz while
 // the realtime stream is flowing. Historical inserts (from the strap's
 // page buffer via SEND_HISTORICAL_DATA) set `sourceKey` so re-syncs

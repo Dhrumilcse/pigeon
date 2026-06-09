@@ -17,6 +17,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "calendar.badge.clock", color: .indigo, name: "MonthlySummary",
                                   subtitle: "Pre-aggregated HR + HRV per month")
                 }
+                NavigationLink(destination: MotionBucketSummaryTableView()) {
+                    TableRowLabel(icon: "figure.walk.motion", color: .orange, name: "MotionBucketSummary",
+                                  subtitle: "Pre-aggregated motion per chart bucket")
+                }
             } header: { Text("Summaries") }
 
             Section {
@@ -186,6 +190,46 @@ struct MonthlySummaryTableView: View {
     }
 }
 
+struct MotionBucketSummaryTableView: View {
+    @Query(sort: \MotionBucketSummary.bucketStart, order: .reverse) private var rows: [MotionBucketSummary]
+
+    private static let schema: [(String, String)] = [
+        ("bucketStart",   "Date — start of the local chart bucket"),
+        ("bucketSeconds", "Int — bucket width in seconds"),
+        ("sampleCount",   "Int — raw motion rows folded into this bucket"),
+        ("stillCount",    "Int — rows below the stillness thresholds"),
+        ("sumMeanDeltaG", "Double — running sum of average movement"),
+        ("maxDeltaG",     "Double — largest movement spike in the bucket"),
+        ("first/last",    "Date? — raw sample coverage inside the bucket"),
+    ]
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Last 100 of \(rows.count)")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows.prefix(100)) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.bucketStart.formatted(date: .abbreviated, time: .shortened))
+                            .font(.headline)
+                        KV("bucket", "\(row.bucketSeconds / 60)m")
+                        KV("samples", "\(row.sampleCount)")
+                        KV("still", "\(row.stillCount)")
+                        KV("avg_motion", String(format: "%.4f g", row.avgMeanDeltaG))
+                        KV("max_spike", String(format: "%.4f g", row.maxDeltaG))
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("MotionBucketSummary")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 struct HRSampleTableView: View {
     @Query(sort: \HRSample.timestamp, order: .reverse) private var rows: [HRSample]
 
@@ -286,11 +330,9 @@ struct HRVSampleTableView: View {
 }
 
 struct MotionSampleTableView: View {
-    @Query(sort: \MotionSample.timestamp, order: .reverse) private var rows: [MotionSample]
-
-    init() {
-        _rows = Query(sort: \MotionSample.timestamp, order: .reverse)
-    }
+    @Environment(\.modelContext) private var modelContext
+    @State private var rows: [MotionSample] = []
+    @State private var totalCount = 0
 
     private static let schema: [(String, String)] = [
         ("timestamp",     "Date — Raw43 frame timestamp from the strap"),
@@ -307,11 +349,11 @@ struct MotionSampleTableView: View {
     var body: some View {
         List {
             SchemaSection(fields: Self.schema)
-            Section(header: Text("Last 100 of \(rows.count)")) {
+            Section(header: Text("Last 100 of \(totalCount)")) {
                 if rows.isEmpty {
                     Text("No data yet").foregroundStyle(.secondary)
                 }
-                ForEach(rows.prefix(100)) { row in
+                ForEach(rows) { row in
                     VStack(alignment: .leading, spacing: 4) {
                         Text(row.timestamp.formatted(date: .omitted, time: .standard))
                             .font(.headline.monospacedDigit())
@@ -331,6 +373,18 @@ struct MotionSampleTableView: View {
         .listStyle(.insetGrouped)
         .navigationTitle("MotionSample")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            loadRows()
+        }
+    }
+
+    private func loadRows() {
+        totalCount = (try? modelContext.fetchCount(FetchDescriptor<MotionSample>())) ?? 0
+        var descriptor = FetchDescriptor<MotionSample>(
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = 100
+        rows = (try? modelContext.fetch(descriptor)) ?? []
     }
 }
 

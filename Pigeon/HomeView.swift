@@ -217,31 +217,34 @@ private enum MotionRange: String, CaseIterable, Identifiable {
 }
 
 private struct MotionStats {
-    static let stillMeanDeltaThresholdG = 0.03
-    static let stillRMSThresholdG = 0.08
-
-    let samples: [MotionSample]
+    let sampleCount: Int
     let stillCount: Int
     let averageMotionG: Double
     let maxSpikeG: Double
+    let firstSampleAt: Date?
+    let lastSampleAt: Date?
 
-    var sampleCount: Int { samples.count }
     var stillnessPercent: Double? {
-        guard !samples.isEmpty else { return nil }
-        return Double(stillCount) * 100.0 / Double(samples.count)
-    }
-    var firstSample: MotionSample? { samples.first }
-    var lastSample: MotionSample? { samples.last }
-
-    static func make(from samples: [MotionSample]) -> MotionStats {
-        let still = samples.filter(isStill).count
-        let avg = samples.isEmpty ? 0 : samples.map(\.meanDeltaG).reduce(0, +) / Double(samples.count)
-        let maxSpike = samples.map(\.maxDeltaG).max() ?? 0
-        return MotionStats(samples: samples, stillCount: still, averageMotionG: avg, maxSpikeG: maxSpike)
+        guard sampleCount > 0 else { return nil }
+        return Double(stillCount) * 100.0 / Double(sampleCount)
     }
 
-    static func isStill(_ sample: MotionSample) -> Bool {
-        sample.meanDeltaG < stillMeanDeltaThresholdG && sample.rmsDeviationG < stillRMSThresholdG
+    static func make(from rows: [MotionBucketSummary]) -> MotionStats {
+        let samples = rows.reduce(0) { $0 + $1.sampleCount }
+        let still = rows.reduce(0) { $0 + $1.stillCount }
+        let weightedMotion = rows.reduce(0.0) { $0 + $1.sumMeanDeltaG }
+        let avg = samples > 0 ? weightedMotion / Double(samples) : 0
+        let maxSpike = rows.map(\.maxDeltaG).max() ?? 0
+        let first = rows.compactMap(\.firstSampleAt).min()
+        let last = rows.compactMap(\.lastSampleAt).max()
+        return MotionStats(
+            sampleCount: samples,
+            stillCount: still,
+            averageMotionG: avg,
+            maxSpikeG: maxSpike,
+            firstSampleAt: first,
+            lastSampleAt: last
+        )
     }
 }
 
@@ -253,13 +256,16 @@ private struct MotionChartPoint: Identifiable {
 }
 
 struct MotionCard: View {
-    @Query private var rows: [MotionSample]
+    @Query private var rows: [MotionBucketSummary]
 
     init() {
         let start = Date().addingTimeInterval(-MotionRange.homeWindowSeconds)
+        let bucketSeconds = Int(MotionRange.day.bucketSeconds)
         _rows = Query(
-            filter: #Predicate<MotionSample> { $0.timestamp >= start },
-            sort: \.timestamp
+            filter: #Predicate<MotionBucketSummary> {
+                $0.bucketStart >= start && $0.bucketSeconds == bucketSeconds
+            },
+            sort: \.bucketStart
         )
     }
 
@@ -325,10 +331,10 @@ struct MotionCard: View {
         let sparkRows = Array(rows.suffix(40))
         if sparkRows.count >= 2 {
             Chart {
-                ForEach(sparkRows, id: \.timestamp) { row in
+                ForEach(sparkRows, id: \.bucketStart) { row in
                     LineMark(
-                        x: .value("Time", row.timestamp),
-                        y: .value("Motion", row.meanDeltaG)
+                        x: .value("Time", row.bucketStart),
+                        y: .value("Motion", row.avgMeanDeltaG)
                     )
                     .interpolationMethod(.linear)
                     .foregroundStyle(Color.orange.opacity(0.9))
@@ -376,7 +382,7 @@ struct MotionDetailView: View {
 
 private struct MotionDetailBody: View {
     let range: MotionRange
-    @Query private var rows: [MotionSample]
+    @Query private var rows: [MotionBucketSummary]
     private let startDate: Date
     private let endDate: Date
 
@@ -387,9 +393,12 @@ private struct MotionDetailBody: View {
         self.endDate = window.end
         let start = window.start
         let end = window.end
+        let bucketSeconds = Int(range.bucketSeconds)
         _rows = Query(
-            filter: #Predicate<MotionSample> { $0.timestamp >= start && $0.timestamp < end },
-            sort: \.timestamp
+            filter: #Predicate<MotionBucketSummary> {
+                $0.bucketStart >= start && $0.bucketStart < end && $0.bucketSeconds == bucketSeconds
+            },
+            sort: \.bucketStart
         )
     }
 
@@ -398,7 +407,7 @@ private struct MotionDetailBody: View {
     }
 
     private var chartPoints: [MotionChartPoint] {
-        MotionBuckets.points(from: rows, bucketSeconds: range.bucketSeconds)
+        MotionBuckets.points(from: rows)
     }
 
     private var xDomain: ClosedRange<Date> {
@@ -481,15 +490,15 @@ private struct MotionDetailBody: View {
     }
 
     private var rangeText: String {
-        guard let first = stats.firstSample, let last = stats.lastSample else {
+        guard let first = stats.firstSampleAt, let last = stats.lastSampleAt else {
             return "No samples for \(range.dateRangeText)"
         }
-        return "\(first.timestamp.formatted(date: .omitted, time: .shortened)) - \(last.timestamp.formatted(date: .omitted, time: .shortened))"
+        return "\(first.formatted(date: .omitted, time: .shortened)) - \(last.formatted(date: .omitted, time: .shortened))"
     }
 
     private var sampleWindowText: String {
-        guard let first = stats.firstSample, let last = stats.lastSample else { return "—" }
-        let minutes = Int(last.timestamp.timeIntervalSince(first.timestamp) / 60)
+        guard let first = stats.firstSampleAt, let last = stats.lastSampleAt else { return "—" }
+        let minutes = Int(last.timeIntervalSince(first) / 60)
         if minutes < 60 { return "\(max(minutes, 0))m" }
         return "\(minutes / 60)h \(minutes % 60)m"
     }
@@ -535,27 +544,14 @@ private enum MotionFormat {
 }
 
 private enum MotionBuckets {
-    static func points(from samples: [MotionSample], bucketSeconds: TimeInterval) -> [MotionChartPoint] {
-        guard bucketSeconds > 0 else { return [] }
-
-        var buckets: [TimeInterval: (sum: Double, count: Int, maxSpike: Double)] = [:]
-        for sample in samples {
-            let bucket = floor(sample.timestamp.timeIntervalSince1970 / bucketSeconds) * bucketSeconds
-            var current = buckets[bucket] ?? (sum: 0, count: 0, maxSpike: 0)
-            current.sum += sample.meanDeltaG
-            current.count += 1
-            current.maxSpike = max(current.maxSpike, sample.maxDeltaG)
-            buckets[bucket] = current
+    static func points(from rows: [MotionBucketSummary]) -> [MotionChartPoint] {
+        rows.compactMap { row in
+            guard row.sampleCount > 0 else { return nil }
+            return MotionChartPoint(
+                date: row.bucketStart,
+                value: row.avgMeanDeltaG,
+                maxSpikeG: row.maxDeltaG
+            )
         }
-
-        return buckets
-            .sorted { $0.key < $1.key }
-            .map { bucket, value in
-                MotionChartPoint(
-                    date: Date(timeIntervalSince1970: bucket),
-                    value: value.count > 0 ? value.sum / Double(value.count) : 0,
-                    maxSpikeG: value.maxSpike
-                )
-            }
     }
 }

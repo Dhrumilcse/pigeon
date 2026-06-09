@@ -151,6 +151,7 @@ class BluetoothManager: NSObject, ObservableObject {
     // to prod WHOOP into refreshing its beat-detection state. Throttled by the
     // same interval so we don't spam the radio.
     private static let rrSilenceNudgeSeconds: TimeInterval = 300
+    private static let motionBucketSeconds = [10 * 60, 60 * 60, 6 * 60 * 60]
     private var lastRealtimeHRNudgeAt: Date?
 
     private var whoopServiceUUIDs: [CBUUID] {
@@ -174,6 +175,7 @@ class BluetoothManager: NSObject, ObservableObject {
         super.init()
         lastHistoricalSyncAt = UserDefaults.standard.object(forKey: Self.lastHistoricalSyncKey) as? Date
         backfillHourlySummariesIfNeeded()
+        backfillMotionBucketSummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -1500,9 +1502,67 @@ extension BluetoothManager: CBPeripheralDelegate {
             maxDeltaG: frame.maxDeltaG,
             sourceKey: "raw43:\(frame.deviceTimestamp):\(frame.subseconds):\(frame.recordHeader)"
         ))
+        updateMotionBucketSummaries(
+            timestamp: timestamp,
+            meanDeltaG: frame.meanDeltaG,
+            rmsDeviationG: frame.rmsDeviationG,
+            maxDeltaG: frame.maxDeltaG
+        )
     }
 
     // MARK: - Summary aggregation
+
+    private func updateMotionBucketSummaries(
+        timestamp: Date,
+        meanDeltaG: Double,
+        rmsDeviationG: Double,
+        maxDeltaG: Double
+    ) {
+        let isStill = MotionStillness.isStill(meanDeltaG: meanDeltaG, rmsDeviationG: rmsDeviationG)
+        for seconds in Self.motionBucketSeconds {
+            let bucketStart = motionBucketStart(of: timestamp, seconds: seconds)
+            let summary = fetchOrCreateMotionBucketSummary(bucketStart: bucketStart, seconds: seconds)
+            summary.sampleCount += 1
+            summary.sumMeanDeltaG += meanDeltaG
+            summary.maxDeltaG = max(summary.maxDeltaG, maxDeltaG)
+            if isStill {
+                summary.stillCount += 1
+            }
+
+            if let first = summary.firstSampleAt {
+                summary.firstSampleAt = min(first, timestamp)
+            } else {
+                summary.firstSampleAt = timestamp
+            }
+
+            if let last = summary.lastSampleAt {
+                summary.lastSampleAt = max(last, timestamp)
+            } else {
+                summary.lastSampleAt = timestamp
+            }
+        }
+    }
+
+    private func fetchOrCreateMotionBucketSummary(bucketStart: Date, seconds: Int) -> MotionBucketSummary {
+        let descriptor = FetchDescriptor<MotionBucketSummary>(
+            predicate: #Predicate {
+                $0.bucketStart == bucketStart && $0.bucketSeconds == seconds
+            }
+        )
+        if let existing = (try? modelContext.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = MotionBucketSummary(bucketStart: bucketStart, bucketSeconds: seconds)
+        modelContext.insert(summary)
+        return summary
+    }
+
+    private func motionBucketStart(of date: Date, seconds: Int) -> Date {
+        let dayStart = Calendar.current.startOfDay(for: date)
+        let offset = max(0, date.timeIntervalSince(dayStart))
+        let bucketOffset = floor(offset / Double(seconds)) * Double(seconds)
+        return dayStart.addingTimeInterval(bucketOffset)
+    }
 
     private func updateDailySummary(bpm: Int) {
         let today = Calendar.current.startOfDay(for: Date())
@@ -1614,6 +1674,59 @@ extension BluetoothManager: CBPeripheralDelegate {
                 let r = row(for: hourStart(of: s.timestamp))
                 r.sumHRV += s.rmssdMS
                 r.hrvSampleCount += 1
+            }
+        }
+
+        try? modelContext.save()
+    }
+
+    private func backfillMotionBucketSummariesIfNeeded() {
+        let missingBucketSizes = Self.motionBucketSeconds.filter { seconds in
+            let descriptor = FetchDescriptor<MotionBucketSummary>(
+                predicate: #Predicate { $0.bucketSeconds == seconds }
+            )
+            return ((try? modelContext.fetchCount(descriptor)) ?? 0) == 0
+        }
+        guard !missingBucketSizes.isEmpty else { return }
+
+        let descriptor = FetchDescriptor<MotionSample>(
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        guard let samples = try? modelContext.fetch(descriptor), !samples.isEmpty else { return }
+
+        for seconds in missingBucketSizes {
+            var summaries: [Date: MotionBucketSummary] = [:]
+
+            for sample in samples {
+                let bucketStart = motionBucketStart(of: sample.timestamp, seconds: seconds)
+                let summary: MotionBucketSummary
+                if let existing = summaries[bucketStart] {
+                    summary = existing
+                } else {
+                    let created = MotionBucketSummary(bucketStart: bucketStart, bucketSeconds: seconds)
+                    modelContext.insert(created)
+                    summaries[bucketStart] = created
+                    summary = created
+                }
+
+                summary.sampleCount += 1
+                summary.sumMeanDeltaG += sample.meanDeltaG
+                summary.maxDeltaG = max(summary.maxDeltaG, sample.maxDeltaG)
+                if MotionStillness.isStill(meanDeltaG: sample.meanDeltaG, rmsDeviationG: sample.rmsDeviationG) {
+                    summary.stillCount += 1
+                }
+
+                if let first = summary.firstSampleAt {
+                    summary.firstSampleAt = min(first, sample.timestamp)
+                } else {
+                    summary.firstSampleAt = sample.timestamp
+                }
+
+                if let last = summary.lastSampleAt {
+                    summary.lastSampleAt = max(last, sample.timestamp)
+                } else {
+                    summary.lastSampleAt = sample.timestamp
+                }
             }
         }
 
