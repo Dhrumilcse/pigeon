@@ -116,6 +116,47 @@ final class MotionBucketSummary {
     }
 }
 
+// Detected main overnight sleep/rest window. The `day` is the local wake day
+// (midnight at the date the window ends), not necessarily the date it starts.
+@Model
+final class SleepWindowSummary {
+    var day: Date
+    var start: Date
+    var end: Date
+    var durationMinutes: Double
+    var confidence: Double
+    var method: String
+    var motionBucketCount: Int
+    var stillBucketCount: Int
+    var hrSampleCount: Int
+    var avgHR: Double?
+    var qualityFlags: String
+
+    init(day: Date,
+         start: Date,
+         end: Date,
+         durationMinutes: Double,
+         confidence: Double,
+         method: String,
+         motionBucketCount: Int,
+         stillBucketCount: Int,
+         hrSampleCount: Int,
+         avgHR: Double?,
+         qualityFlags: String) {
+        self.day = day
+        self.start = start
+        self.end = end
+        self.durationMinutes = durationMinutes
+        self.confidence = confidence
+        self.method = method
+        self.motionBucketCount = motionBucketCount
+        self.stillBucketCount = stillBucketCount
+        self.hrSampleCount = hrSampleCount
+        self.avgHR = avgHR
+        self.qualityFlags = qualityFlags
+    }
+}
+
 // One heart-rate reading from the WHOOP strap. Written at ~1 Hz while
 // the realtime stream is flowing. Historical inserts (from the strap's
 // page buffer via SEND_HISTORICAL_DATA) set `sourceKey` so re-syncs

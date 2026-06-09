@@ -40,6 +40,12 @@ struct SettingsView: View {
                     } label: {
                         SettingsRow(icon: "waveform.path.ecg", iconColor: .purple, title: "Heart Rate Variability")
                     }
+
+                    NavigationLink {
+                        SleepWindowAboutView()
+                    } label: {
+                        SettingsRow(icon: "moon.zzz.fill", iconColor: .indigo, title: "Sleep Window")
+                    }
                 }
 
                 Section {
@@ -724,5 +730,117 @@ struct HRVAboutView: View {
         .background(Color(.systemGroupedBackground))
         .navigationTitle("Heart Rate Variability")
         .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+// MARK: - About Sleep Window
+
+struct SleepWindowAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Sleep Window")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Pigeon detects the main overnight sleep window as the longest high-confidence rest period that ends on the wake day. It is currently a sleep/rest window detector, not a sleep-stage classifier.")
+
+                    Text("The detector starts from 10-minute motion summary buckets so it can stay fast. For each wake day, it searches from the previous evening through late morning, marks quiet buckets, merges short restless gaps, and then uses heart rate as a confirmation signal.")
+
+                    CalculationStep(title: "Search window", text: "For a given wake day, scan motion buckets from 6 hours before midnight through 14 hours after midnight. This catches sleep that starts the night before and ends in the morning.")
+
+                    CalculationStep(title: "Quiet buckets", text: "A 10-minute bucket is considered still when at least 70% of its motion samples are still, or when its average movement is below the stillness threshold.")
+
+                    CalculationStep(title: "Candidate windows", text: "Consecutive still buckets are merged into candidate windows. Short restless gaps up to 20 minutes are allowed so brief movement does not split the night. Candidates shorter than 60 minutes are ignored.")
+
+                    CalculationStep(title: "Heart-rate check", text: "For each candidate, Pigeon compares the average heart rate inside the window against the median heart rate across the full overnight search period. Lower, steady heart rate improves confidence.")
+
+                    CalculationStep(title: "Final score", text: "Candidates are scored using duration, stillness density, heart-rate confirmation, and overlap with the expected overnight period. The highest-confidence candidate becomes the stored SleepWindowSummary row.")
+
+                    Text("Because the first pass uses 10-minute buckets, start and end times are expected to be fuzzy by roughly 10 to 20 minutes. The next accuracy improvement is to refine only the edges by scanning raw motion samples around the detected start and end.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Core Logic")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text(Self.pseudocode)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color(.tertiarySystemGroupedBackground))
+                        )
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Sleep Window")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private static let pseudocode = """
+for each wake_day:
+  search_start = wake_day_midnight - 6h
+  search_end   = wake_day_midnight + 14h
+
+  buckets = fetch 10-minute motion summaries
+
+  for each bucket:
+    still_fraction = still_count / sample_count
+    is_still = still_fraction >= 70%
+            or avg_motion <= stillness_threshold
+
+  candidates = merge consecutive still buckets
+    allow gaps/restlessness up to 20 minutes
+    discard windows shorter than 60 minutes
+
+  baseline_hr = median HR across search window
+
+  for each candidate:
+    candidate_hr = HR samples inside candidate
+    avg_hr = mean(candidate_hr)
+
+    score =
+      duration_score * 25% +
+      stillness_score * 35% +
+      heart_rate_score * 25% +
+      overnight_overlap_score * 15%
+
+  store the highest-scoring candidate
+"""
+}
+
+private struct CalculationStep: View {
+    let title: String
+    let text: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+            Text(text)
+                .foregroundColor(.secondary)
+        }
     }
 }

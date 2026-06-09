@@ -17,6 +17,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "calendar.badge.clock", color: .indigo, name: "MonthlySummary",
                                   subtitle: "Pre-aggregated HR + HRV per month")
                 }
+                NavigationLink(destination: SleepWindowSummaryTableView()) {
+                    TableRowLabel(icon: "bed.double.fill", color: .purple, name: "SleepWindowSummary",
+                                  subtitle: "Detected overnight sleep windows")
+                }
                 NavigationLink(destination: MotionBucketSummaryTableView()) {
                     TableRowLabel(icon: "figure.walk.motion", color: .orange, name: "MotionBucketSummary",
                                   subtitle: "Pre-aggregated motion per chart bucket")
@@ -226,6 +230,52 @@ struct MotionBucketSummaryTableView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("MotionBucketSummary")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct SleepWindowSummaryTableView: View {
+    @Query(sort: \SleepWindowSummary.day, order: .reverse) private var rows: [SleepWindowSummary]
+
+    private static let schema: [(String, String)] = [
+        ("day",               "Date — local wake day, midnight"),
+        ("start",             "Date — detected sleep/rest start"),
+        ("end",               "Date — detected sleep/rest end"),
+        ("durationMinutes",   "Double — detected window length"),
+        ("confidence",        "Double — 0...1 detector confidence"),
+        ("method",            "String — detector version"),
+        ("motionBucketCount", "Int — expected 10m buckets in the window"),
+        ("stillBucketCount",  "Int — quiet 10m buckets"),
+        ("hrSampleCount",     "Int — HR samples inside the window"),
+        ("avgHR",             "Double? — mean HR inside the window"),
+        ("qualityFlags",      "String — comma-separated detector notes"),
+    ]
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Rows (\(rows.count))")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.day.formatted(date: .abbreviated, time: .omitted))
+                            .font(.headline)
+                        KV("window", "\(row.start.formatted(date: .omitted, time: .shortened)) - \(row.end.formatted(date: .omitted, time: .shortened))")
+                        KV("duration", String(format: "%.1f hr", row.durationMinutes / 60.0))
+                        KV("confidence", String(format: "%.0f%%", row.confidence * 100))
+                        KV("motion", "\(row.stillBucketCount) / \(row.motionBucketCount) still buckets")
+                        KV("hr_samples", "\(row.hrSampleCount)")
+                        KV("avg_hr", row.avgHR.map { String(format: "%.1f bpm", $0) } ?? "—")
+                        KV("flags", row.qualityFlags)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("SleepWindowSummary")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

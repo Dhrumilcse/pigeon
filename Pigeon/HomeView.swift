@@ -26,6 +26,13 @@ struct HomeView: View {
                             .buttonStyle(.plain)
 
                             NavigationLink {
+                                SleepWindowDetailView()
+                            } label: {
+                                SleepWindowCard()
+                            }
+                            .buttonStyle(.plain)
+
+                            NavigationLink {
                                 HRVDetailView()
                             } label: {
                                 HRVCard()
@@ -137,6 +144,401 @@ private struct LiveHRPill: View {
                 .foregroundColor(.primary)
                 .monospacedDigit()
         }
+    }
+}
+
+// MARK: - Sleep Window
+
+private enum SleepWindowRange: String, CaseIterable, Identifiable {
+    case day = "D"
+    case week = "W"
+    case month = "M"
+    case sixMonths = "6M"
+    case year = "Y"
+
+    var id: String { rawValue }
+
+    var dayCount: Int {
+        switch self {
+        case .day: return 1
+        case .week: return 7
+        case .month: return 30
+        case .sixMonths: return 180
+        case .year: return 365
+        }
+    }
+
+    var xStride: HealthXStride {
+        switch self {
+        case .day: return HealthXStride(component: .hour, count: 6)
+        case .week: return HealthXStride(component: .day, count: 2)
+        case .month: return HealthXStride(component: .day, count: 7)
+        case .sixMonths: return HealthXStride(component: .month, count: 2)
+        case .year: return HealthXStride(component: .month, count: 2)
+        }
+    }
+
+    var xFormat: Date.FormatStyle {
+        switch self {
+        case .day: return .dateTime.hour()
+        case .week: return .dateTime.weekday(.abbreviated)
+        case .sixMonths, .year: return .dateTime.month(.abbreviated)
+        case .month: return .dateTime.day()
+        }
+    }
+
+    var dateWindow: (start: Date, end: Date) {
+        let cal = Calendar.current
+        let todayStart = cal.startOfDay(for: Date())
+        let start = cal.date(byAdding: .day, value: -(dayCount - 1), to: todayStart) ?? todayStart
+        let end = cal.date(byAdding: .day, value: 1, to: todayStart) ?? Date()
+        return (start, end)
+    }
+
+    var dateRangeText: String {
+        let window = dateWindow
+        if self == .day {
+            return window.start.formatted(.dateTime.weekday(.wide).month(.abbreviated).day())
+        }
+        let lastDay = Calendar.current.date(byAdding: .day, value: -1, to: window.end) ?? window.end
+        return "\(window.start.formatted(.dateTime.month(.abbreviated).day())) - \(lastDay.formatted(.dateTime.month(.abbreviated).day().year()))"
+    }
+}
+
+struct SleepWindowCard: View {
+    @Query(sort: \SleepWindowSummary.day, order: .reverse) private var rows: [SleepWindowSummary]
+
+    private var latest: SleepWindowSummary? {
+        rows.first
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "bed.double.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundColor(.indigo)
+                    Text("Sleep")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundColor(.indigo)
+                }
+                Spacer()
+                Text(dateText)
+                    .font(.system(size: 15))
+                    .foregroundColor(.secondary)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundColor(.secondary.opacity(0.6))
+            }
+
+            HStack(alignment: .bottom) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("TIME ASLEEP")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundColor(.secondary)
+                        .tracking(0.5)
+
+                    durationValue
+                }
+
+                Spacer()
+                windowValue
+                    .padding(.bottom, 6)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(Color(.systemGray6))
+        )
+    }
+
+    private var dateText: String {
+        latest?.day.formatted(.dateTime.month(.abbreviated).day()) ?? Date().formatted(.dateTime.month(.abbreviated).day())
+    }
+
+    @ViewBuilder
+    private var durationValue: some View {
+        if let latest {
+            let parts = SleepWindowFormat.durationParts(minutes: latest.durationMinutes)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("\(parts.hours)")
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.primary)
+                    .monospacedDigit()
+                Text("hr")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(.secondary)
+                Text("\(parts.minutes)")
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.primary)
+                    .monospacedDigit()
+                Text("min")
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
+        } else {
+            Text("-")
+                .font(.system(size: 34, weight: .bold))
+                .foregroundColor(.primary)
+        }
+    }
+
+    @ViewBuilder
+    private var windowValue: some View {
+        if let latest {
+            VStack(alignment: .trailing, spacing: 2) {
+                windowTimeText(latest.start)
+                HStack {
+                    Spacer()
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.45))
+                        .frame(width: 1, height: 10)
+                    Spacer()
+                }
+                .frame(width: 72)
+                windowTimeText(latest.end)
+            }
+        } else {
+            Text("No window")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(.secondary)
+        }
+    }
+
+    private func windowTimeText(_ date: Date) -> some View {
+        Text(date.formatted(date: .omitted, time: .shortened))
+            .font(.system(size: 15, weight: .medium))
+            .foregroundColor(.secondary)
+            .monospacedDigit()
+            .frame(width: 72, alignment: .trailing)
+    }
+}
+
+struct SleepWindowDetailView: View {
+    @State private var range: SleepWindowRange = .week
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Picker("Range", selection: $range) {
+                    ForEach(SleepWindowRange.allCases) { r in
+                        Text(r.rawValue).tag(r)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                SleepWindowDetailBody(range: range).id(range)
+
+                HealthOptionsSection(
+                    unitText: "min",
+                    showAllData: { ShowAllSleepWindowDataView() },
+                    unitPicker: { HealthUnitPickerView(title: "Sleep Duration Unit", unit: "min") }
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Sleep Window")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct SleepWindowDetailBody: View {
+    let range: SleepWindowRange
+    @Query private var rows: [SleepWindowSummary]
+    private let startDate: Date
+    private let endDate: Date
+
+    init(range: SleepWindowRange) {
+        self.range = range
+        let window = range.dateWindow
+        self.startDate = window.start
+        self.endDate = window.end
+        let start = window.start
+        let end = window.end
+        _rows = Query(
+            filter: #Predicate<SleepWindowSummary> { $0.day >= start && $0.day < end },
+            sort: \.day
+        )
+    }
+
+    private var points: [HealthPoint] {
+        rows.map { HealthPoint(date: $0.day, value: $0.durationMinutes) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            HealthChartContainer(
+                headerLabel: "AVERAGE DURATION",
+                avgText: averageMinutesText,
+                unitLabel: "min",
+                dateRangeText: range.dateRangeText,
+                points: points,
+                xDomain: startDate...endDate,
+                xStride: range.xStride,
+                xFormat: range.xFormat,
+                tooltipDateFormat: .dateTime.month(.abbreviated).day().year(),
+                tint: .indigo,
+                yStep: 60
+            )
+            latestSummary
+        }
+    }
+
+    private var latestSummary: some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), spacing: 10)], spacing: 10) {
+            SleepWindowSummaryTile(title: "Latest", value: latestDuration, unit: nil)
+            SleepWindowSummaryTile(title: "Window", value: latestWindowText, unit: nil)
+            SleepWindowSummaryTile(title: "Confidence", value: latestConfidenceText, unit: nil)
+            SleepWindowSummaryTile(title: "Avg HR", value: latestAvgHRText, unit: nil)
+        }
+    }
+
+    private var latest: SleepWindowSummary? {
+        rows.last
+    }
+
+    private var averageMinutesText: String {
+        guard !rows.isEmpty else { return "-" }
+        let avg = rows.map(\.durationMinutes).reduce(0, +) / Double(rows.count)
+        return "\(Int(avg.rounded()))"
+    }
+
+    private var latestDuration: String {
+        guard let latest else { return "-" }
+        return SleepWindowFormat.duration(minutes: latest.durationMinutes)
+    }
+
+    private var latestWindowText: String {
+        guard let latest else { return "-" }
+        let start = latest.start.formatted(date: .omitted, time: .shortened)
+        let end = latest.end.formatted(date: .omitted, time: .shortened)
+        return "\(start) - \(end)"
+    }
+
+    private var latestConfidenceText: String {
+        guard let latest else { return "-" }
+        return "\(Int((latest.confidence * 100).rounded()))%"
+    }
+
+    private var latestAvgHRText: String {
+        guard let value = latest?.avgHR else { return "-" }
+        return "\(Int(value.rounded())) bpm"
+    }
+}
+
+struct ShowAllSleepWindowDataView: View {
+    @Query(sort: \SleepWindowSummary.day, order: .reverse) private var rows: [SleepWindowSummary]
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                if rows.isEmpty {
+                    ContentUnavailableView(
+                        "No Sleep Windows",
+                        systemImage: "moon.zzz",
+                        description: Text("Leave Pigeon connected while wearing WHOOP overnight to detect a sleep window.")
+                    )
+                    .frame(minHeight: 260)
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(rows) { row in
+                            SleepWindowDataRow(row: row)
+                            if row.persistentModelID != rows.last?.persistentModelID {
+                                Divider().padding(.leading, 16)
+                            }
+                        }
+                    }
+                    .background(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .fill(Color(.secondarySystemGroupedBackground))
+                    )
+                }
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("All Recorded Data")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct SleepWindowDataRow: View {
+    let row: SleepWindowSummary
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(row.day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day().year()))
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Text(SleepWindowFormat.duration(minutes: row.durationMinutes))
+                    .font(.system(size: 17, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+            }
+            HStack {
+                Text("\(row.start.formatted(date: .omitted, time: .shortened)) - \(row.end.formatted(date: .omitted, time: .shortened))")
+                Spacer()
+                Text("\(Int((row.confidence * 100).rounded()))%")
+            }
+            .font(.system(size: 14))
+            .foregroundColor(.secondary)
+            if row.qualityFlags != "ok" {
+                Text(row.qualityFlags)
+                    .font(.system(size: 13))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(16)
+    }
+}
+
+private struct SleepWindowSummaryTile: View {
+    let title: String
+    let value: String
+    let unit: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary)
+                .tracking(0.4)
+            HStack(alignment: .firstTextBaseline, spacing: 3) {
+                Text(value)
+                    .font(.system(size: 22, weight: .semibold, design: .rounded))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                if let unit {
+                    Text(unit)
+                        .font(.system(size: 13))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+    }
+}
+
+private enum SleepWindowFormat {
+    static func durationParts(minutes: Double) -> (hours: Int, minutes: Int) {
+        let total = max(0, Int(minutes.rounded()))
+        return (total / 60, total % 60)
+    }
+
+    static func duration(minutes: Double) -> String {
+        let parts = durationParts(minutes: minutes)
+        return "\(parts.hours)h \(parts.minutes)m"
     }
 }
 

@@ -152,7 +152,18 @@ class BluetoothManager: NSObject, ObservableObject {
     // same interval so we don't spam the radio.
     private static let rrSilenceNudgeSeconds: TimeInterval = 300
     private static let motionBucketSeconds = [10 * 60, 60 * 60, 6 * 60 * 60]
+    private static let sleepWindowBackfillKey = "pigeon.sleepWindowBackfillVersion"
+    private static let sleepWindowBackfillVersion = 1
+    private static let sleepWindowBucketSeconds = 10 * 60
+    private static let sleepSearchStartOffset: TimeInterval = -6 * 60 * 60
+    private static let sleepSearchEndOffset: TimeInterval = 14 * 60 * 60
+    private static let sleepStillFraction = 0.70
+    private static let sleepMergeGapSeconds: TimeInterval = 20 * 60
+    private static let sleepMinimumDurationSeconds: TimeInterval = 60 * 60
+    private static let sleepHRBaselineMultiplier = 1.05
+    private static let sleepRefreshThrottleSeconds: TimeInterval = 15 * 60
     private var lastRealtimeHRNudgeAt: Date?
+    private var lastSleepWindowRefreshAt: Date?
 
     private var whoopServiceUUIDs: [CBUUID] {
         [whoopServiceGen5, whoopServiceGen4]
@@ -176,6 +187,7 @@ class BluetoothManager: NSObject, ObservableObject {
         lastHistoricalSyncAt = UserDefaults.standard.object(forKey: Self.lastHistoricalSyncKey) as? Date
         backfillHourlySummariesIfNeeded()
         backfillMotionBucketSummariesIfNeeded()
+        backfillSleepWindowSummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -547,6 +559,7 @@ class BluetoothManager: NSObject, ObservableObject {
         })
         for day in days {
             rebuildDailySummaryFromSamples(for: day)
+            refreshSleepWindowSummariesAround(day, force: true)
             rebuildMonthlySummary(for: day)
         }
         try? modelContext.save()
@@ -1478,8 +1491,9 @@ extension BluetoothManager: CBPeripheralDelegate {
     private func persistHeartRateSample(_ bpm: Int) {
         let now = Date()
         modelContext.insert(HRSample(timestamp: now, bpm: bpm))
-        updateDailySummary(bpm: bpm)
         updateHourlySummary(bpm: bpm, at: now)
+        updateDailySummary(bpm: bpm, at: now)
+        refreshSleepWindowSummariesAround(now)
     }
 
     private func persistMotionSample(_ frame: Gen5RawAccelFrame) {
@@ -1508,6 +1522,7 @@ extension BluetoothManager: CBPeripheralDelegate {
             rmsDeviationG: frame.rmsDeviationG,
             maxDeltaG: frame.maxDeltaG
         )
+        refreshSleepWindowSummariesAround(timestamp)
     }
 
     // MARK: - Summary aggregation
@@ -1564,8 +1579,8 @@ extension BluetoothManager: CBPeripheralDelegate {
         return dayStart.addingTimeInterval(bucketOffset)
     }
 
-    private func updateDailySummary(bpm: Int) {
-        let today = Calendar.current.startOfDay(for: Date())
+    private func updateDailySummary(bpm: Int, at timestamp: Date) {
+        let today = Calendar.current.startOfDay(for: timestamp)
         let summary = fetchOrCreateDailySummary(for: today)
         if summary.hrSampleCount == 0 {
             summary.minHR = bpm
@@ -1731,6 +1746,292 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
 
         try? modelContext.save()
+    }
+
+    private struct SleepMotionBucket {
+        let start: Date
+        let end: Date
+        let isStill: Bool
+        let stillFraction: Double
+    }
+
+    private struct SleepCandidate {
+        let start: Date
+        let end: Date
+        let durationSeconds: TimeInterval
+        let motionBucketCount: Int
+        let stillBucketCount: Int
+        let avgStillFraction: Double
+    }
+
+    private struct DetectedSleepWindow {
+        let start: Date
+        let end: Date
+        let durationSeconds: TimeInterval
+        let confidence: Double
+        let motionBucketCount: Int
+        let stillBucketCount: Int
+        let hrSampleCount: Int
+        let avgHR: Double?
+        let qualityFlags: String
+    }
+
+    private func refreshSleepWindowSummariesAround(_ timestamp: Date, force: Bool = false) {
+        let now = Date()
+        if !force,
+           let last = lastSleepWindowRefreshAt,
+           now.timeIntervalSince(last) < Self.sleepRefreshThrottleSeconds {
+            return
+        }
+        if !force {
+            lastSleepWindowRefreshAt = now
+        }
+
+        let dayStart = Calendar.current.startOfDay(for: timestamp)
+        refreshSleepWindowSummary(forWakeDay: dayStart)
+        if let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) {
+            refreshSleepWindowSummary(forWakeDay: nextDay)
+        }
+    }
+
+    private func refreshSleepWindowSummary(forWakeDay wakeDay: Date) {
+        let searchStart = wakeDay.addingTimeInterval(Self.sleepSearchStartOffset)
+        let searchEnd = wakeDay.addingTimeInterval(Self.sleepSearchEndOffset)
+        let bucketSeconds = Self.sleepWindowBucketSeconds
+        let descriptor = FetchDescriptor<MotionBucketSummary>(
+            predicate: #Predicate {
+                $0.bucketSeconds == bucketSeconds &&
+                $0.bucketStart >= searchStart &&
+                $0.bucketStart < searchEnd
+            },
+            sortBy: [SortDescriptor(\.bucketStart)]
+        )
+        let rows = (try? modelContext.fetch(descriptor)) ?? []
+        guard let detected = detectSleepWindow(from: rows, wakeDay: wakeDay) else {
+            if let existing = fetchSleepWindowSummary(forWakeDay: wakeDay) {
+                modelContext.delete(existing)
+            }
+            return
+        }
+
+        upsertSleepWindowSummary(day: wakeDay, detected: detected)
+        rebuildMonthlySummary(for: wakeDay)
+    }
+
+    private func detectSleepWindow(from rows: [MotionBucketSummary], wakeDay: Date) -> DetectedSleepWindow? {
+        let buckets = rows.compactMap { row -> SleepMotionBucket? in
+            guard row.sampleCount > 0 else { return nil }
+            let stillFraction = Double(row.stillCount) / Double(row.sampleCount)
+            let isStill = stillFraction >= Self.sleepStillFraction ||
+                row.avgMeanDeltaG <= MotionStillness.meanDeltaThresholdG
+            return SleepMotionBucket(
+                start: row.bucketStart,
+                end: row.bucketStart.addingTimeInterval(Double(row.bucketSeconds)),
+                isStill: isStill,
+                stillFraction: stillFraction
+            )
+        }
+        guard !buckets.isEmpty else { return nil }
+
+        let candidates = sleepCandidates(from: buckets)
+            .filter { $0.durationSeconds >= Self.sleepMinimumDurationSeconds }
+        guard !candidates.isEmpty else { return nil }
+
+        let searchStart = wakeDay.addingTimeInterval(Self.sleepSearchStartOffset)
+        let searchEnd = wakeDay.addingTimeInterval(Self.sleepSearchEndOffset)
+        let searchHR = fetchHeartRateBPMs(start: searchStart, end: searchEnd)
+        let baselineHR = median(searchHR)
+        let nightStart = wakeDay.addingTimeInterval(-3 * 60 * 60)
+        let nightEnd = wakeDay.addingTimeInterval(11 * 60 * 60)
+
+        return candidates.compactMap { candidate -> DetectedSleepWindow? in
+            let hr = fetchHeartRateBPMs(start: candidate.start, end: candidate.end)
+            let avgHR = hr.isEmpty ? nil : hr.reduce(0.0) { $0 + Double($1) } / Double(hr.count)
+            var flags: [String] = []
+
+            let hrScore: Double
+            if hr.count < 30 {
+                hrScore = 0.55
+                flags.append("hr_sparse")
+            } else if let baseline = baselineHR, let avg = avgHR {
+                let confirmed = avg <= baseline * Self.sleepHRBaselineMultiplier
+                hrScore = confirmed ? 1.0 : 0.25
+                if !confirmed {
+                    flags.append("hr_above_baseline")
+                }
+            } else {
+                hrScore = 0.65
+                flags.append("hr_baseline_missing")
+            }
+
+            let durationScore = min(candidate.durationSeconds / (8 * 60 * 60), 1.0)
+            let stillDensity = Double(candidate.stillBucketCount) / Double(max(1, candidate.motionBucketCount))
+            let stillScore = min(max(stillDensity, 0.0), 1.0)
+            let overnightScore = min(overlapSeconds(candidate.start, candidate.end, nightStart, nightEnd) / candidate.durationSeconds, 1.0)
+            let confidence = min(max(
+                durationScore * 0.25 +
+                stillScore * 0.35 +
+                hrScore * 0.25 +
+                overnightScore * 0.15,
+                0.0
+            ), 1.0)
+
+            if confidence < 0.60 {
+                flags.append("low_confidence")
+            }
+
+            return DetectedSleepWindow(
+                start: candidate.start,
+                end: candidate.end,
+                durationSeconds: candidate.durationSeconds,
+                confidence: confidence,
+                motionBucketCount: candidate.motionBucketCount,
+                stillBucketCount: candidate.stillBucketCount,
+                hrSampleCount: hr.count,
+                avgHR: avgHR,
+                qualityFlags: flags.isEmpty ? "ok" : flags.joined(separator: ",")
+            )
+        }
+        .max {
+            if abs($0.confidence - $1.confidence) > 0.001 {
+                return $0.confidence < $1.confidence
+            }
+            return $0.durationSeconds < $1.durationSeconds
+        }
+    }
+
+    private func sleepCandidates(from buckets: [SleepMotionBucket]) -> [SleepCandidate] {
+        var candidates: [SleepCandidate] = []
+        var start: Date?
+        var end: Date?
+        var stillCount = 0
+        var stillFractionSum = 0.0
+
+        func closeCurrent() {
+            guard let s = start, let e = end else { return }
+            let duration = e.timeIntervalSince(s)
+            let expectedBuckets = max(1, Int(round(duration / Double(Self.sleepWindowBucketSeconds))))
+            candidates.append(SleepCandidate(
+                start: s,
+                end: e,
+                durationSeconds: duration,
+                motionBucketCount: expectedBuckets,
+                stillBucketCount: stillCount,
+                avgStillFraction: stillCount > 0 ? stillFractionSum / Double(stillCount) : 0
+            ))
+            start = nil
+            end = nil
+            stillCount = 0
+            stillFractionSum = 0
+        }
+
+        for bucket in buckets where bucket.isStill {
+            if let currentEnd = end,
+               bucket.start.timeIntervalSince(currentEnd) <= Self.sleepMergeGapSeconds {
+                end = max(currentEnd, bucket.end)
+                stillCount += 1
+                stillFractionSum += bucket.stillFraction
+            } else {
+                closeCurrent()
+                start = bucket.start
+                end = bucket.end
+                stillCount = 1
+                stillFractionSum = bucket.stillFraction
+            }
+        }
+        closeCurrent()
+        return candidates
+    }
+
+    private func fetchHeartRateBPMs(start: Date, end: Date) -> [Int] {
+        let descriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end }
+        )
+        return ((try? modelContext.fetch(descriptor)) ?? []).map(\.bpm)
+    }
+
+    private func median(_ values: [Int]) -> Double? {
+        let sorted = values.sorted()
+        guard !sorted.isEmpty else { return nil }
+        let middle = sorted.count / 2
+        if sorted.count % 2 == 0 {
+            return (Double(sorted[middle - 1]) + Double(sorted[middle])) / 2.0
+        }
+        return Double(sorted[middle])
+    }
+
+    private func overlapSeconds(_ start: Date, _ end: Date, _ otherStart: Date, _ otherEnd: Date) -> TimeInterval {
+        let lower = max(start, otherStart)
+        let upper = min(end, otherEnd)
+        return max(0, upper.timeIntervalSince(lower))
+    }
+
+    private func fetchSleepWindowSummary(forWakeDay day: Date) -> SleepWindowSummary? {
+        let descriptor = FetchDescriptor<SleepWindowSummary>(
+            predicate: #Predicate { $0.day == day }
+        )
+        return (try? modelContext.fetch(descriptor))?.first
+    }
+
+    private func upsertSleepWindowSummary(day: Date, detected: DetectedSleepWindow) {
+        let summary = fetchSleepWindowSummary(forWakeDay: day) ?? {
+            let created = SleepWindowSummary(
+                day: day,
+                start: detected.start,
+                end: detected.end,
+                durationMinutes: detected.durationSeconds / 60.0,
+                confidence: detected.confidence,
+                method: "motion_hr_v1",
+                motionBucketCount: detected.motionBucketCount,
+                stillBucketCount: detected.stillBucketCount,
+                hrSampleCount: detected.hrSampleCount,
+                avgHR: detected.avgHR,
+                qualityFlags: detected.qualityFlags
+            )
+            modelContext.insert(created)
+            return created
+        }()
+
+        summary.start = detected.start
+        summary.end = detected.end
+        summary.durationMinutes = detected.durationSeconds / 60.0
+        summary.confidence = detected.confidence
+        summary.method = "motion_hr_v1"
+        summary.motionBucketCount = detected.motionBucketCount
+        summary.stillBucketCount = detected.stillBucketCount
+        summary.hrSampleCount = detected.hrSampleCount
+        summary.avgHR = detected.avgHR
+        summary.qualityFlags = detected.qualityFlags
+    }
+
+    private func backfillSleepWindowSummariesIfNeeded() {
+        let version = UserDefaults.standard.integer(forKey: Self.sleepWindowBackfillKey)
+        guard version < Self.sleepWindowBackfillVersion else { return }
+
+        let bucketSeconds = Self.sleepWindowBucketSeconds
+        let descriptor = FetchDescriptor<MotionBucketSummary>(
+            predicate: #Predicate { $0.bucketSeconds == bucketSeconds },
+            sortBy: [SortDescriptor(\.bucketStart)]
+        )
+        let buckets = (try? modelContext.fetch(descriptor)) ?? []
+        guard !buckets.isEmpty else { return }
+
+        let calendar = Calendar.current
+        var days = Set<Date>()
+        for bucket in buckets {
+            let day = calendar.startOfDay(for: bucket.bucketStart)
+            days.insert(day)
+            if let nextDay = calendar.date(byAdding: .day, value: 1, to: day) {
+                days.insert(nextDay)
+            }
+        }
+
+        for day in days.sorted() {
+            refreshSleepWindowSummary(forWakeDay: day)
+            rebuildMonthlySummary(for: day)
+        }
+        try? modelContext.save()
+        UserDefaults.standard.set(Self.sleepWindowBackfillVersion, forKey: Self.sleepWindowBackfillKey)
     }
 
     private func fetchOrCreateDailySummary(for startOfDay: Date) -> DailySummary {
