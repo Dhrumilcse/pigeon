@@ -747,7 +747,7 @@ struct SleepWindowAboutView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("Pigeon detects the main overnight sleep window as the longest high-confidence rest period that ends on the wake day. It is currently a sleep/rest window detector, not a sleep-stage classifier.")
 
-                    Text("The detector starts from 10-minute motion summary buckets so it can stay fast. For each wake day, it searches from the previous evening through late morning, marks quiet buckets, merges short restless gaps, and then uses heart rate as a confirmation signal.")
+                    Text("The detector starts from 10-minute motion summary buckets so it can stay fast. For each wake day, it searches from the previous evening through late morning, marks quiet buckets, merges short restless gaps, refines the edges with raw motion, and then uses heart rate as a confirmation signal.")
 
                     CalculationStep(title: "Search window", text: "For a given wake day, scan motion buckets from 6 hours before midnight through 14 hours after midnight. This catches sleep that starts the night before and ends in the morning.")
 
@@ -755,11 +755,13 @@ struct SleepWindowAboutView: View {
 
                     CalculationStep(title: "Candidate windows", text: "Consecutive still buckets are merged into candidate windows. Short restless gaps up to 20 minutes are allowed so brief movement does not split the night. Candidates shorter than 60 minutes are ignored.")
 
+                    CalculationStep(title: "Edge refinement", text: "For each candidate, Pigeon scans raw motion near the coarse start and end. It uses 3-minute rolling stillness windows to tighten the motion boundary, then can move the start later until heart rate and stillness remain settled for 15 minutes.")
+
                     CalculationStep(title: "Heart-rate check", text: "For each candidate, Pigeon compares the average heart rate inside the window against the median heart rate across the full overnight search period. Lower, steady heart rate improves confidence.")
 
                     CalculationStep(title: "Final score", text: "Candidates are scored using duration, stillness density, heart-rate confirmation, and overlap with the expected overnight period. The highest-confidence candidate becomes the stored SleepWindowSummary row.")
 
-                    Text("Because the first pass uses 10-minute buckets, start and end times are expected to be fuzzy by roughly 10 to 20 minutes. The next accuracy improvement is to refine only the edges by scanning raw motion samples around the detected start and end.")
+                    Text("The first pass still uses 10-minute buckets, but only the candidate edges scan raw motion. This keeps the detector efficient while reducing the 10-minute bucket-boundary fuzz.")
                 }
                 .font(.system(size: 17))
                 .foregroundColor(.primary)
@@ -815,10 +817,15 @@ for each wake_day:
     allow gaps/restlessness up to 20 minutes
     discard windows shorter than 60 minutes
 
+  for each candidate:
+    refine start with raw motion near coarse start
+    refine start later until HR + stillness settle for 15m
+    refine end with raw motion near coarse end
+
   baseline_hr = median HR across search window
 
   for each candidate:
-    candidate_hr = HR samples inside candidate
+    candidate_hr = HR samples inside refined candidate
     avg_hr = mean(candidate_hr)
 
     score =
