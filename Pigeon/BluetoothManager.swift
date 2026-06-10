@@ -153,7 +153,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let rrSilenceNudgeSeconds: TimeInterval = 300
     private static let motionBucketSeconds = [10 * 60, 60 * 60, 6 * 60 * 60]
     private static let sleepWindowBackfillKey = "pigeon.sleepWindowBackfillVersion"
-    private static let sleepWindowBackfillVersion = 1
+    private static let sleepWindowBackfillVersion = 3
     private static let sleepWindowBucketSeconds = 10 * 60
     private static let sleepSearchStartOffset: TimeInterval = -6 * 60 * 60
     private static let sleepSearchEndOffset: TimeInterval = 14 * 60 * 60
@@ -162,6 +162,16 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let sleepMinimumDurationSeconds: TimeInterval = 60 * 60
     private static let sleepHRBaselineMultiplier = 1.05
     private static let sleepRefreshThrottleSeconds: TimeInterval = 15 * 60
+    private static let sleepEdgeOutsideSeconds: TimeInterval = 15 * 60
+    private static let sleepEdgeInsideSeconds: TimeInterval = 30 * 60
+    private static let sleepEdgeRollingWindowSeconds: TimeInterval = 3 * 60
+    private static let sleepEdgeMinimumRawFrames = 4
+    private static let sleepStartHRInsideSeconds: TimeInterval = 45 * 60
+    private static let sleepStartHRRollingWindowSeconds: TimeInterval = 5 * 60
+    private static let sleepStartHRSustainedSeconds: TimeInterval = 15 * 60
+    private static let sleepStartHRSettledMultiplier = 1.08
+    private static let sleepStartHRSettledToleranceBPM = 3.0
+    private static let sleepStartMinimumHRSamples = 20
     private var lastRealtimeHRNudgeAt: Date?
     private var lastSleepWindowRefreshAt: Date?
 
@@ -1776,6 +1786,37 @@ extension BluetoothManager: CBPeripheralDelegate {
         let qualityFlags: String
     }
 
+    private struct SleepEdgeRefinement {
+        let start: Date
+        let end: Date
+        let flags: [String]
+    }
+
+    private struct SleepStartRefinement {
+        let date: Date
+        let flags: [String]
+    }
+
+    private struct RawMotionWindow {
+        let start: Date
+        let end: Date
+        let sampleCount: Int
+        let stillFraction: Double
+        let avgMeanDeltaG: Double
+
+        var isStill: Bool {
+            stillFraction >= BluetoothManager.sleepStillFraction ||
+                avgMeanDeltaG <= MotionStillness.meanDeltaThresholdG
+        }
+    }
+
+    private struct HRRollingWindow {
+        let start: Date
+        let end: Date
+        let sampleCount: Int
+        let avgBPM: Double
+    }
+
     private func refreshSleepWindowSummariesAround(_ timestamp: Date, force: Bool = false) {
         let now = Date()
         if !force,
@@ -1845,9 +1886,11 @@ extension BluetoothManager: CBPeripheralDelegate {
         let nightEnd = wakeDay.addingTimeInterval(11 * 60 * 60)
 
         return candidates.compactMap { candidate -> DetectedSleepWindow? in
-            let hr = fetchHeartRateBPMs(start: candidate.start, end: candidate.end)
+            let refined = refineSleepCandidateEdges(candidate)
+            let durationSeconds = refined.end.timeIntervalSince(refined.start)
+            let hr = fetchHeartRateBPMs(start: refined.start, end: refined.end)
             let avgHR = hr.isEmpty ? nil : hr.reduce(0.0) { $0 + Double($1) } / Double(hr.count)
-            var flags: [String] = []
+            var flags = refined.flags
 
             let hrScore: Double
             if hr.count < 30 {
@@ -1864,10 +1907,11 @@ extension BluetoothManager: CBPeripheralDelegate {
                 flags.append("hr_baseline_missing")
             }
 
-            let durationScore = min(candidate.durationSeconds / (8 * 60 * 60), 1.0)
-            let stillDensity = Double(candidate.stillBucketCount) / Double(max(1, candidate.motionBucketCount))
+            let durationScore = min(durationSeconds / (8 * 60 * 60), 1.0)
+            let motionBucketCount = max(1, Int(round(durationSeconds / Double(Self.sleepWindowBucketSeconds))))
+            let stillDensity = Double(candidate.stillBucketCount) / Double(max(1, motionBucketCount))
             let stillScore = min(max(stillDensity, 0.0), 1.0)
-            let overnightScore = min(overlapSeconds(candidate.start, candidate.end, nightStart, nightEnd) / candidate.durationSeconds, 1.0)
+            let overnightScore = min(overlapSeconds(refined.start, refined.end, nightStart, nightEnd) / durationSeconds, 1.0)
             let confidence = min(max(
                 durationScore * 0.25 +
                 stillScore * 0.35 +
@@ -1881,11 +1925,11 @@ extension BluetoothManager: CBPeripheralDelegate {
             }
 
             return DetectedSleepWindow(
-                start: candidate.start,
-                end: candidate.end,
-                durationSeconds: candidate.durationSeconds,
+                start: refined.start,
+                end: refined.end,
+                durationSeconds: durationSeconds,
                 confidence: confidence,
-                motionBucketCount: candidate.motionBucketCount,
+                motionBucketCount: motionBucketCount,
                 stillBucketCount: candidate.stillBucketCount,
                 hrSampleCount: hr.count,
                 avgHR: avgHR,
@@ -1943,11 +1987,221 @@ extension BluetoothManager: CBPeripheralDelegate {
         return candidates
     }
 
+    private func refineSleepCandidateEdges(_ candidate: SleepCandidate) -> SleepEdgeRefinement {
+        let settledSleepHR = median(fetchHeartRateBPMs(
+            start: candidate.start.addingTimeInterval(Self.sleepStartHRInsideSeconds),
+            end: candidate.end
+        ))
+        let startRefinement = refineSleepStart(around: candidate.start, settledSleepHR: settledSleepHR)
+        let refinedStart = startRefinement?.date ?? candidate.start
+        let refinedEnd = refineSleepEnd(around: candidate.end) ?? candidate.end
+        var flags = startRefinement?.flags ?? []
+
+        if abs(refinedEnd.timeIntervalSince(candidate.end)) >= 60 {
+            flags.append("raw_end_refined")
+        }
+
+        guard refinedEnd.timeIntervalSince(refinedStart) >= Self.sleepMinimumDurationSeconds else {
+            flags.append("raw_edges_invalid")
+            return SleepEdgeRefinement(start: candidate.start, end: candidate.end, flags: flags)
+        }
+
+        return SleepEdgeRefinement(start: refinedStart, end: refinedEnd, flags: flags)
+    }
+
+    private func refineSleepStart(around coarseStart: Date, settledSleepHR: Double?) -> SleepStartRefinement? {
+        let scanStart = coarseStart.addingTimeInterval(-Self.sleepEdgeOutsideSeconds)
+        let scanEnd = coarseStart.addingTimeInterval(max(Self.sleepEdgeInsideSeconds, Self.sleepStartHRInsideSeconds))
+        let windows = rawMotionWindows(start: scanStart, end: scanEnd)
+        guard !windows.isEmpty else { return nil }
+
+        let rawStart = windows.first(where: { $0.start >= coarseStart && $0.isStill })?.start ??
+            windows.first(where: \.isStill)?.start
+        guard let rawStart else { return nil }
+
+        var flags: [String] = []
+        if abs(rawStart.timeIntervalSince(coarseStart)) >= 60 {
+            flags.append("raw_start_refined")
+        }
+
+        if let hrStart = refineSleepStartWithHeartRate(
+            coarseStart: coarseStart,
+            lowerBound: max(rawStart, coarseStart),
+            scanEnd: scanEnd,
+            settledSleepHR: settledSleepHR,
+            rawWindows: windows
+        ) {
+            if hrStart.timeIntervalSince(rawStart) >= 60 {
+                flags.append("hr_start_refined")
+            }
+            return SleepStartRefinement(date: hrStart, flags: flags)
+        }
+
+        return SleepStartRefinement(date: rawStart, flags: flags)
+    }
+
+    private func refineSleepStartWithHeartRate(
+        coarseStart: Date,
+        lowerBound: Date,
+        scanEnd: Date,
+        settledSleepHR: Double?,
+        rawWindows: [RawMotionWindow]
+    ) -> Date? {
+        guard let settledSleepHR else { return nil }
+        let threshold = max(
+            settledSleepHR * Self.sleepStartHRSettledMultiplier,
+            settledSleepHR + Self.sleepStartHRSettledToleranceBPM
+        )
+        let hrWindows = heartRateRollingWindows(start: coarseStart, end: scanEnd)
+        guard !hrWindows.isEmpty else { return nil }
+
+        return hrWindows.first { window in
+            let sustainedEnd = window.start.addingTimeInterval(Self.sleepStartHRSustainedSeconds)
+            return window.start >= lowerBound &&
+                window.avgBPM <= threshold &&
+                sustainedEnd <= scanEnd &&
+                heartRateStaysSettled(start: window.start, end: sustainedEnd, threshold: threshold) &&
+                rawMotionStaysStill(start: window.start, end: sustainedEnd, windows: rawWindows)
+        }?.start
+    }
+
+    private func refineSleepEnd(around coarseEnd: Date) -> Date? {
+        let scanStart = coarseEnd.addingTimeInterval(-Self.sleepEdgeInsideSeconds)
+        let scanEnd = coarseEnd.addingTimeInterval(Self.sleepEdgeOutsideSeconds)
+        let windows = rawMotionWindows(start: scanStart, end: scanEnd)
+        guard !windows.isEmpty else { return nil }
+
+        var sawStill = false
+        var lastStillEnd: Date?
+        for window in windows {
+            if window.isStill {
+                sawStill = true
+                lastStillEnd = window.end
+            } else if sawStill {
+                return window.start
+            }
+        }
+        return lastStillEnd
+    }
+
+    private func rawMotionWindows(start: Date, end: Date) -> [RawMotionWindow] {
+        let samples = fetchMotionSamples(start: start, end: end)
+        guard samples.count >= Self.sleepEdgeMinimumRawFrames else { return [] }
+
+        var windows: [RawMotionWindow] = []
+        var endIndex = 0
+        var stillCount = 0
+        var meanDeltaSum = 0.0
+
+        for startIndex in samples.indices {
+            let windowStart = samples[startIndex].timestamp
+            let windowEnd = windowStart.addingTimeInterval(Self.sleepEdgeRollingWindowSeconds)
+
+            while endIndex < samples.count && samples[endIndex].timestamp < windowEnd {
+                let sample = samples[endIndex]
+                if MotionStillness.isStill(meanDeltaG: sample.meanDeltaG, rmsDeviationG: sample.rmsDeviationG) {
+                    stillCount += 1
+                }
+                meanDeltaSum += sample.meanDeltaG
+                endIndex += 1
+            }
+
+            let count = endIndex - startIndex
+            if count >= Self.sleepEdgeMinimumRawFrames {
+                windows.append(RawMotionWindow(
+                    start: windowStart,
+                    end: windowEnd,
+                    sampleCount: count,
+                    stillFraction: Double(stillCount) / Double(count),
+                    avgMeanDeltaG: meanDeltaSum / Double(count)
+                ))
+            }
+
+            let outgoing = samples[startIndex]
+            if MotionStillness.isStill(meanDeltaG: outgoing.meanDeltaG, rmsDeviationG: outgoing.rmsDeviationG) {
+                stillCount -= 1
+            }
+            meanDeltaSum -= outgoing.meanDeltaG
+        }
+
+        return windows
+    }
+
+    private func rawMotionIsStill(near timestamp: Date, windows: [RawMotionWindow]) -> Bool {
+        windows.min {
+            abs($0.start.timeIntervalSince(timestamp)) < abs($1.start.timeIntervalSince(timestamp))
+        }?.isStill == true
+    }
+
+    private func rawMotionStaysStill(start: Date, end: Date, windows: [RawMotionWindow]) -> Bool {
+        let overlapping = windows.filter { $0.start >= start && $0.start < end }
+        guard !overlapping.isEmpty else { return false }
+        let stillCount = overlapping.filter(\.isStill).count
+        return Double(stillCount) / Double(overlapping.count) >= Self.sleepStillFraction
+    }
+
+    private func heartRateStaysSettled(start: Date, end: Date, threshold: Double) -> Bool {
+        let samples = fetchHeartRateBPMs(start: start, end: end)
+        let minimumSamples = Self.sleepStartMinimumHRSamples * 3
+        guard samples.count >= minimumSamples else { return false }
+        let avg = samples.reduce(0.0) { $0 + Double($1) } / Double(samples.count)
+        return avg <= threshold
+    }
+
+    private func heartRateRollingWindows(start: Date, end: Date) -> [HRRollingWindow] {
+        let samples = fetchHeartRateSamples(start: start, end: end)
+        guard samples.count >= Self.sleepStartMinimumHRSamples else { return [] }
+
+        var windows: [HRRollingWindow] = []
+        var endIndex = 0
+        var bpmSum = 0
+
+        for startIndex in samples.indices {
+            let windowStart = samples[startIndex].timestamp
+            let windowEnd = windowStart.addingTimeInterval(Self.sleepStartHRRollingWindowSeconds)
+
+            while endIndex < samples.count && samples[endIndex].timestamp < windowEnd {
+                bpmSum += samples[endIndex].bpm
+                endIndex += 1
+            }
+
+            let count = endIndex - startIndex
+            if count >= Self.sleepStartMinimumHRSamples {
+                windows.append(HRRollingWindow(
+                    start: windowStart,
+                    end: windowEnd,
+                    sampleCount: count,
+                    avgBPM: Double(bpmSum) / Double(count)
+                ))
+            }
+
+            bpmSum -= samples[startIndex].bpm
+        }
+
+        return windows
+    }
+
     private func fetchHeartRateBPMs(start: Date, end: Date) -> [Int] {
         let descriptor = FetchDescriptor<HRSample>(
             predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end }
         )
         return ((try? modelContext.fetch(descriptor)) ?? []).map(\.bpm)
+    }
+
+    private func fetchHeartRateSamples(start: Date, end: Date) -> [HRSample] {
+        let descriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private func fetchMotionSamples(start: Date, end: Date) -> [MotionSample] {
+        let descriptor = FetchDescriptor<MotionSample>(
+            predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
     }
 
     private func median(_ values: [Int]) -> Double? {
@@ -1981,7 +2235,7 @@ extension BluetoothManager: CBPeripheralDelegate {
                 end: detected.end,
                 durationMinutes: detected.durationSeconds / 60.0,
                 confidence: detected.confidence,
-                method: "motion_hr_v1",
+                method: "motion_hr_raw_edges_v3",
                 motionBucketCount: detected.motionBucketCount,
                 stillBucketCount: detected.stillBucketCount,
                 hrSampleCount: detected.hrSampleCount,
@@ -1996,7 +2250,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.end = detected.end
         summary.durationMinutes = detected.durationSeconds / 60.0
         summary.confidence = detected.confidence
-        summary.method = "motion_hr_v1"
+        summary.method = "motion_hr_raw_edges_v3"
         summary.motionBucketCount = detected.motionBucketCount
         summary.stillBucketCount = detected.stillBucketCount
         summary.hrSampleCount = detected.hrSampleCount
