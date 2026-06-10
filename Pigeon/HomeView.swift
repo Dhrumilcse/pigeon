@@ -244,7 +244,7 @@ struct SleepWindowCard: View {
 
                 Spacer()
                 windowValue
-                    .padding(.bottom, 6)
+                    .padding(.bottom, 5)
             }
         }
         .padding(16)
