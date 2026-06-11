@@ -9,7 +9,7 @@ struct PigeonApp: App {
         do {
             modelContainer = try ModelContainer(for: HRSample.self, RRSample.self, HRVSample.self,
                                                     MotionSample.self, MotionBucketSummary.self,
-                                                    SleepWindowSummary.self,
+                                                    SleepWindowSummary.self, RecoverySummary.self,
                                                     HourlySummary.self, DailySummary.self,
                                                     MonthlySummary.self)
         } catch {

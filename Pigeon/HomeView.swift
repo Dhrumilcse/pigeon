@@ -18,6 +18,18 @@ struct HomeView: View {
                             .padding(.top, 8)
 
                         VStack(spacing: 12) {
+                            HStack(alignment: .top, spacing: 12) {
+                                SleepPerformanceCard()
+                                    .frame(maxWidth: .infinity)
+                                NavigationLink {
+                                    RecoveryDetailView()
+                                } label: {
+                                    RecoveryCard()
+                                }
+                                .frame(maxWidth: .infinity)
+                                .buttonStyle(.plain)
+                            }
+
                             NavigationLink {
                                 HeartRateDetailView()
                             } label: {
@@ -62,6 +74,21 @@ struct HomeView: View {
             }
             .navigationBarHidden(true)
         }
+    }
+}
+
+// MARK: - Sleep performance (placeholder)
+
+struct SleepPerformanceCard: View {
+    var body: some View {
+        HomeScoreCard(
+            icon: "moon.zzz.fill",
+            tint: .indigo,
+            title: "Sleep Performance",
+            scoreText: "",
+            unitText: "",
+            isAvailable: false
+        )
     }
 }
 

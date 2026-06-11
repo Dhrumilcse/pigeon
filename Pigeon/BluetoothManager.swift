@@ -153,7 +153,9 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let rrSilenceNudgeSeconds: TimeInterval = 300
     private static let motionBucketSeconds = [10 * 60, 60 * 60, 6 * 60 * 60]
     private static let sleepWindowBackfillKey = "pigeon.sleepWindowBackfillVersion"
-    private static let sleepWindowBackfillVersion = 4
+    private static let sleepWindowBackfillVersion = 5
+    private static let recoveryBackfillKey = "pigeon.recoveryBackfillVersion"
+    private static let recoveryBackfillVersion = 1
     private static let sleepWindowBucketSeconds = 10 * 60
     private static let sleepSearchStartOffset: TimeInterval = -6 * 60 * 60
     private static let sleepSearchEndOffset: TimeInterval = 14 * 60 * 60
@@ -168,10 +170,16 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let sleepEdgeMinimumRawFrames = 4
     private static let sleepStartHRInsideSeconds: TimeInterval = 45 * 60
     private static let sleepStartHRRollingWindowSeconds: TimeInterval = 5 * 60
-    private static let sleepStartHRSustainedSeconds: TimeInterval = 15 * 60
-    private static let sleepStartHRSettledMultiplier = 1.08
-    private static let sleepStartHRSettledToleranceBPM = 3.0
     private static let sleepStartMinimumHRSamples = 20
+    private static let sleepOnsetInBedHRVBaselineSeconds: TimeInterval = 20 * 60
+    private static let sleepOnsetScanMaxSeconds: TimeInterval = 90 * 60
+    private static let sleepOnsetHRVMultiplier = 1.15
+    private static let sleepOnsetHRVSustainedSeconds: TimeInterval = 10 * 60
+    private static let sleepOnsetMinimumHRVSamples = 3
+    private static let sleepOnsetHRRollingWindowSeconds: TimeInterval = 10 * 60
+    private static let sleepWakeHRRiseMultiplier = 1.08
+    private static let sleepWakeHRRiseToleranceBPM = 5.0
+    private static let sleepWakeHRSustainedSeconds: TimeInterval = 8 * 60
     private var lastRealtimeHRNudgeAt: Date?
     private var lastSleepWindowRefreshAt: Date?
 
@@ -198,6 +206,7 @@ class BluetoothManager: NSObject, ObservableObject {
         backfillHourlySummariesIfNeeded()
         backfillMotionBucketSummariesIfNeeded()
         backfillSleepWindowSummariesIfNeeded()
+        backfillRecoverySummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -1792,11 +1801,6 @@ extension BluetoothManager: CBPeripheralDelegate {
         let flags: [String]
     }
 
-    private struct SleepStartRefinement {
-        let date: Date
-        let flags: [String]
-    }
-
     private struct RawMotionWindow {
         let start: Date
         let end: Date
@@ -1808,6 +1812,10 @@ extension BluetoothManager: CBPeripheralDelegate {
             stillFraction >= BluetoothManager.sleepStillFraction ||
                 avgMeanDeltaG <= MotionStillness.meanDeltaThresholdG
         }
+
+        var isDeepStill: Bool {
+            MotionStillness.isDeepStill(stillFraction: stillFraction, avgMeanDeltaG: avgMeanDeltaG)
+        }
     }
 
     private struct HRRollingWindow {
@@ -1815,6 +1823,13 @@ extension BluetoothManager: CBPeripheralDelegate {
         let end: Date
         let sampleCount: Int
         let avgBPM: Double
+    }
+
+    private struct HRVRollingWindow {
+        let start: Date
+        let end: Date
+        let sampleCount: Int
+        let avgRMSSD: Double
     }
 
     private func refreshSleepWindowSummariesAround(_ timestamp: Date, force: Bool = false) {
@@ -1852,10 +1867,12 @@ extension BluetoothManager: CBPeripheralDelegate {
             if let existing = fetchSleepWindowSummary(forWakeDay: wakeDay) {
                 modelContext.delete(existing)
             }
+            deleteRecoverySummary(forWakeDay: wakeDay)
             return
         }
 
         upsertSleepWindowSummary(day: wakeDay, detected: detected)
+        rebuildRecoverySummary(forWakeDay: wakeDay)
         rebuildMonthlySummary(for: wakeDay)
     }
 
@@ -1988,80 +2005,144 @@ extension BluetoothManager: CBPeripheralDelegate {
     }
 
     private func refineSleepCandidateEdges(_ candidate: SleepCandidate) -> SleepEdgeRefinement {
-        let settledSleepHR = median(fetchHeartRateBPMs(
-            start: candidate.start.addingTimeInterval(Self.sleepStartHRInsideSeconds),
-            end: candidate.end
-        ))
-        let startRefinement = refineSleepStart(around: candidate.start, settledSleepHR: settledSleepHR)
-        let refinedStart = startRefinement?.date ?? candidate.start
-        let refinedEnd = refineSleepEnd(around: candidate.end) ?? candidate.end
-        var flags = startRefinement?.flags ?? []
+        let inBedStart = refineInBedStart(around: candidate.start) ?? candidate.start
+        var flags: [String] = []
 
-        if abs(refinedEnd.timeIntervalSince(candidate.end)) >= 60 {
+        if abs(inBedStart.timeIntervalSince(candidate.start)) >= 60 {
+            flags.append("raw_start_refined")
+        }
+
+        let asleepStart: Date
+        if let refined = refineAsleepStart(after: inBedStart, before: candidate.end, flags: &flags) {
+            asleepStart = refined
+        } else {
+            asleepStart = inBedStart
+            flags.append("onset_unrefined")
+        }
+
+        let motionEnd = refineSleepEnd(around: candidate.end) ?? candidate.end
+        var refinedEnd = motionEnd
+        if abs(motionEnd.timeIntervalSince(candidate.end)) >= 60 {
             flags.append("raw_end_refined")
         }
 
-        guard refinedEnd.timeIntervalSince(refinedStart) >= Self.sleepMinimumDurationSeconds else {
+        if let hrWake = refineSleepEndWithHeartRate(
+            around: candidate.end,
+            sleepStart: asleepStart,
+            motionEnd: motionEnd
+        ), hrWake < refinedEnd {
+            refinedEnd = hrWake
+            flags.append("hr_wake_refined")
+        }
+
+        guard refinedEnd.timeIntervalSince(asleepStart) >= Self.sleepMinimumDurationSeconds else {
             flags.append("raw_edges_invalid")
             return SleepEdgeRefinement(start: candidate.start, end: candidate.end, flags: flags)
         }
 
-        return SleepEdgeRefinement(start: refinedStart, end: refinedEnd, flags: flags)
+        return SleepEdgeRefinement(start: asleepStart, end: refinedEnd, flags: flags)
     }
 
-    private func refineSleepStart(around coarseStart: Date, settledSleepHR: Double?) -> SleepStartRefinement? {
+    private func refineInBedStart(around coarseStart: Date) -> Date? {
         let scanStart = coarseStart.addingTimeInterval(-Self.sleepEdgeOutsideSeconds)
         let scanEnd = coarseStart.addingTimeInterval(max(Self.sleepEdgeInsideSeconds, Self.sleepStartHRInsideSeconds))
         let windows = rawMotionWindows(start: scanStart, end: scanEnd)
         guard !windows.isEmpty else { return nil }
 
-        let rawStart = windows.first(where: { $0.start >= coarseStart && $0.isStill })?.start ??
+        return windows.first(where: { $0.start >= coarseStart && $0.isStill })?.start ??
             windows.first(where: \.isStill)?.start
-        guard let rawStart else { return nil }
-
-        var flags: [String] = []
-        if abs(rawStart.timeIntervalSince(coarseStart)) >= 60 {
-            flags.append("raw_start_refined")
-        }
-
-        if let hrStart = refineSleepStartWithHeartRate(
-            coarseStart: coarseStart,
-            lowerBound: max(rawStart, coarseStart),
-            scanEnd: scanEnd,
-            settledSleepHR: settledSleepHR,
-            rawWindows: windows
-        ) {
-            if hrStart.timeIntervalSince(rawStart) >= 60 {
-                flags.append("hr_start_refined")
-            }
-            return SleepStartRefinement(date: hrStart, flags: flags)
-        }
-
-        return SleepStartRefinement(date: rawStart, flags: flags)
     }
 
-    private func refineSleepStartWithHeartRate(
-        coarseStart: Date,
-        lowerBound: Date,
-        scanEnd: Date,
-        settledSleepHR: Double?,
-        rawWindows: [RawMotionWindow]
+    private func refineAsleepStart(
+        after inBedStart: Date,
+        before candidateEnd: Date,
+        flags: inout [String]
     ) -> Date? {
-        guard let settledSleepHR else { return nil }
-        let threshold = max(
-            settledSleepHR * Self.sleepStartHRSettledMultiplier,
-            settledSleepHR + Self.sleepStartHRSettledToleranceBPM
+        let maxScan = inBedStart.addingTimeInterval(Self.sleepOnsetScanMaxSeconds)
+        let scanEnd = min(candidateEnd, maxScan)
+        guard scanEnd.timeIntervalSince(inBedStart) >= Self.sleepEdgeRollingWindowSeconds else {
+            return nil
+        }
+
+        let hrvOnset = refineAsleepStartWithHRV(after: inBedStart, before: scanEnd)
+        let motionOnset = refineAsleepStartWithDeepMotion(after: inBedStart, before: scanEnd)
+
+        switch (hrvOnset, motionOnset) {
+        case let (hrv?, motion?):
+            flags.append("onset_dual_signal")
+            return max(hrv, motion)
+        case let (hrv?, nil):
+            flags.append("hrv_onset_refined")
+            return hrv
+        case let (nil, motion?):
+            flags.append("deep_still_onset_refined")
+            return motion
+        case (nil, nil):
+            return nil
+        }
+    }
+
+    private func refineAsleepStartWithHRV(after inBedStart: Date, before scanEnd: Date) -> Date? {
+        let baselineEnd = min(
+            inBedStart.addingTimeInterval(Self.sleepOnsetInBedHRVBaselineSeconds),
+            scanEnd
         )
-        let hrWindows = heartRateRollingWindows(start: coarseStart, end: scanEnd)
+        let baselineValues = fetchHRVValues(start: inBedStart, end: baselineEnd)
+        guard baselineValues.count >= Self.sleepOnsetMinimumHRVSamples,
+              let inBedHRV = median(baselineValues) else {
+            return nil
+        }
+
+        let threshold = inBedHRV * Self.sleepOnsetHRVMultiplier
+        let windows = hrvRollingWindows(start: inBedStart, end: scanEnd)
+        guard !windows.isEmpty else { return nil }
+
+        return windows.first { window in
+            let sustainedEnd = window.start.addingTimeInterval(Self.sleepOnsetHRVSustainedSeconds)
+            return window.start >= inBedStart &&
+                window.avgRMSSD >= threshold &&
+                sustainedEnd <= scanEnd &&
+                hrvStaysElevated(start: window.start, end: sustainedEnd, threshold: threshold)
+        }?.start
+    }
+
+    private func refineAsleepStartWithDeepMotion(after inBedStart: Date, before scanEnd: Date) -> Date? {
+        let windows = rawMotionWindows(start: inBedStart, end: scanEnd)
+        return windows.first { window in
+            window.start >= inBedStart && window.isDeepStill
+        }?.start
+    }
+
+    private func refineSleepEndWithHeartRate(
+        around coarseEnd: Date,
+        sleepStart: Date,
+        motionEnd: Date
+    ) -> Date? {
+        let duration = motionEnd.timeIntervalSince(sleepStart)
+        guard duration > 0 else { return nil }
+
+        let baselineStart = sleepStart.addingTimeInterval(duration / 3)
+        let baselineEnd = sleepStart.addingTimeInterval(2 * duration / 3)
+        guard let sleepBaselineHR = median(fetchHeartRateBPMs(start: baselineStart, end: baselineEnd)) else {
+            return nil
+        }
+
+        let threshold = max(
+            sleepBaselineHR * Self.sleepWakeHRRiseMultiplier,
+            sleepBaselineHR + Self.sleepWakeHRRiseToleranceBPM
+        )
+
+        let scanStart = coarseEnd.addingTimeInterval(-Self.sleepEdgeInsideSeconds)
+        let scanEnd = coarseEnd.addingTimeInterval(Self.sleepEdgeOutsideSeconds)
+        let hrWindows = heartRateRollingWindows(start: scanStart, end: scanEnd)
         guard !hrWindows.isEmpty else { return nil }
 
         return hrWindows.first { window in
-            let sustainedEnd = window.start.addingTimeInterval(Self.sleepStartHRSustainedSeconds)
-            return window.start >= lowerBound &&
-                window.avgBPM <= threshold &&
+            let sustainedEnd = window.start.addingTimeInterval(Self.sleepWakeHRSustainedSeconds)
+            return window.start >= scanStart &&
+                window.avgBPM >= threshold &&
                 sustainedEnd <= scanEnd &&
-                heartRateStaysSettled(start: window.start, end: sustainedEnd, threshold: threshold) &&
-                rawMotionStaysStill(start: window.start, end: sustainedEnd, windows: rawWindows)
+                heartRateStaysElevated(start: window.start, end: sustainedEnd, threshold: threshold)
         }?.start
     }
 
@@ -2127,25 +2208,19 @@ extension BluetoothManager: CBPeripheralDelegate {
         return windows
     }
 
-    private func rawMotionIsStill(near timestamp: Date, windows: [RawMotionWindow]) -> Bool {
-        windows.min {
-            abs($0.start.timeIntervalSince(timestamp)) < abs($1.start.timeIntervalSince(timestamp))
-        }?.isStill == true
-    }
-
-    private func rawMotionStaysStill(start: Date, end: Date, windows: [RawMotionWindow]) -> Bool {
-        let overlapping = windows.filter { $0.start >= start && $0.start < end }
-        guard !overlapping.isEmpty else { return false }
-        let stillCount = overlapping.filter(\.isStill).count
-        return Double(stillCount) / Double(overlapping.count) >= Self.sleepStillFraction
-    }
-
-    private func heartRateStaysSettled(start: Date, end: Date, threshold: Double) -> Bool {
+    private func heartRateStaysElevated(start: Date, end: Date, threshold: Double) -> Bool {
         let samples = fetchHeartRateBPMs(start: start, end: end)
-        let minimumSamples = Self.sleepStartMinimumHRSamples * 3
+        let minimumSamples = Self.sleepStartMinimumHRSamples * 2
         guard samples.count >= minimumSamples else { return false }
         let avg = samples.reduce(0.0) { $0 + Double($1) } / Double(samples.count)
-        return avg <= threshold
+        return avg >= threshold
+    }
+
+    private func hrvStaysElevated(start: Date, end: Date, threshold: Double) -> Bool {
+        let values = fetchHRVValues(start: start, end: end)
+        guard values.count >= Self.sleepOnsetMinimumHRVSamples else { return false }
+        let avg = values.reduce(0.0, +) / Double(values.count)
+        return avg >= threshold
     }
 
     private func heartRateRollingWindows(start: Date, end: Date) -> [HRRollingWindow] {
@@ -2181,6 +2256,39 @@ extension BluetoothManager: CBPeripheralDelegate {
         return windows
     }
 
+    private func hrvRollingWindows(start: Date, end: Date) -> [HRVRollingWindow] {
+        let samples = fetchHRVSamples(start: start, end: end)
+        guard samples.count >= Self.sleepOnsetMinimumHRVSamples else { return [] }
+
+        var windows: [HRVRollingWindow] = []
+        var endIndex = 0
+        var rmssdSum = 0.0
+
+        for startIndex in samples.indices {
+            let windowStart = samples[startIndex].timestamp
+            let windowEnd = windowStart.addingTimeInterval(Self.sleepOnsetHRRollingWindowSeconds)
+
+            while endIndex < samples.count && samples[endIndex].timestamp < windowEnd {
+                rmssdSum += samples[endIndex].rmssdMS
+                endIndex += 1
+            }
+
+            let count = endIndex - startIndex
+            if count >= Self.sleepOnsetMinimumHRVSamples {
+                windows.append(HRVRollingWindow(
+                    start: windowStart,
+                    end: windowEnd,
+                    sampleCount: count,
+                    avgRMSSD: rmssdSum / Double(count)
+                ))
+            }
+
+            rmssdSum -= samples[startIndex].rmssdMS
+        }
+
+        return windows
+    }
+
     private func fetchHeartRateBPMs(start: Date, end: Date) -> [Int] {
         let descriptor = FetchDescriptor<HRSample>(
             predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end }
@@ -2204,14 +2312,30 @@ extension BluetoothManager: CBPeripheralDelegate {
         return (try? modelContext.fetch(descriptor)) ?? []
     }
 
+    private func fetchHRVSamples(start: Date, end: Date) -> [HRVSample] {
+        let descriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private func fetchHRVValues(start: Date, end: Date) -> [Double] {
+        fetchHRVSamples(start: start, end: end).map(\.rmssdMS)
+    }
+
     private func median(_ values: [Int]) -> Double? {
+        median(values.map(Double.init))
+    }
+
+    private func median(_ values: [Double]) -> Double? {
         let sorted = values.sorted()
         guard !sorted.isEmpty else { return nil }
         let middle = sorted.count / 2
         if sorted.count % 2 == 0 {
-            return (Double(sorted[middle - 1]) + Double(sorted[middle])) / 2.0
+            return (sorted[middle - 1] + sorted[middle]) / 2.0
         }
-        return Double(sorted[middle])
+        return sorted[middle]
     }
 
     private func overlapSeconds(_ start: Date, _ end: Date, _ otherStart: Date, _ otherEnd: Date) -> TimeInterval {
@@ -2241,7 +2365,7 @@ extension BluetoothManager: CBPeripheralDelegate {
                 end: detected.end,
                 durationMinutes: detected.durationSeconds / 60.0,
                 confidence: detected.confidence,
-                method: "motion_hr_raw_edges_v3",
+                method: "motion_hr_hrv_asleep_v4",
                 motionBucketCount: detected.motionBucketCount,
                 stillBucketCount: detected.stillBucketCount,
                 hrSampleCount: detected.hrSampleCount,
@@ -2256,12 +2380,125 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.end = detected.end
         summary.durationMinutes = detected.durationSeconds / 60.0
         summary.confidence = detected.confidence
-        summary.method = "motion_hr_raw_edges_v3"
+        summary.method = "motion_hr_hrv_asleep_v4"
         summary.motionBucketCount = detected.motionBucketCount
         summary.stillBucketCount = detected.stillBucketCount
         summary.hrSampleCount = detected.hrSampleCount
         summary.avgHR = rhr
         summary.qualityFlags = detected.qualityFlags
+    }
+
+    private func fetchRecoverySummary(forWakeDay day: Date) -> RecoverySummary? {
+        let descriptor = FetchDescriptor<RecoverySummary>(
+            predicate: #Predicate { $0.day == day }
+        )
+        return (try? modelContext.fetch(descriptor))?.first
+    }
+
+    private func deleteRecoverySummary(forWakeDay day: Date) {
+        if let existing = fetchRecoverySummary(forWakeDay: day) {
+            modelContext.delete(existing)
+        }
+    }
+
+    private func computeRecoveryBaseline(before wakeDay: Date) -> RecoveryScore.Baseline {
+        let lookbackStart = Calendar.current.date(
+            byAdding: .day,
+            value: -RecoveryScore.baselineLookbackDays,
+            to: wakeDay
+        ) ?? wakeDay
+        let minimumHRVSamples = RecoveryScore.minimumHRVSamples
+        let descriptor = FetchDescriptor<RecoverySummary>(
+            predicate: #Predicate<RecoverySummary> {
+                $0.day >= lookbackStart &&
+                $0.day < wakeDay &&
+                $0.hrvSampleCount >= minimumHRVSamples
+            }
+        )
+        let rows = (try? modelContext.fetch(descriptor)) ?? []
+        let eligible = rows.filter { $0.rhrBPM > 0 && $0.sleepMinutes > 0 && $0.hrvMS > 0 }
+        guard !eligible.isEmpty else {
+            return RecoveryScore.Baseline(hrvMS: 0, rhrBPM: 0, sleepMinutes: 0, dayCount: 0)
+        }
+        return RecoveryScore.Baseline(
+            hrvMS: RecoveryScore.median(eligible.map(\.hrvMS)) ?? 0,
+            rhrBPM: RecoveryScore.median(eligible.map(\.rhrBPM)) ?? 0,
+            sleepMinutes: RecoveryScore.median(eligible.map(\.sleepMinutes)) ?? 0,
+            dayCount: eligible.count
+        )
+    }
+
+    private func rebuildRecoverySummary(forWakeDay wakeDay: Date) {
+        guard let window = fetchSleepWindowSummary(forWakeDay: wakeDay),
+              window.confidence >= SleepWindowDetection.minimumConfidence,
+              let rhr = window.avgHR else {
+            deleteRecoverySummary(forWakeDay: wakeDay)
+            return
+        }
+
+        let hrvValues = fetchHRVValues(start: window.start, end: window.end)
+        let hrvMS = hrvValues.isEmpty ? 0 : hrvValues.reduce(0, +) / Double(hrvValues.count)
+        let baseline = computeRecoveryBaseline(before: wakeDay)
+        let nightly = RecoveryScore.NightlyMetrics(
+            hrvMS: hrvMS,
+            rhrBPM: rhr,
+            sleepMinutes: window.durationMinutes,
+            hrvSampleCount: hrvValues.count
+        )
+        let computed = RecoveryScore.compute(today: nightly, baseline: baseline)
+
+        let summary = fetchRecoverySummary(forWakeDay: wakeDay) ?? {
+            let created = RecoverySummary(
+                day: wakeDay,
+                score: computed?.score,
+                zone: computed?.zone ?? .unavailable,
+                method: RecoveryScore.method,
+                hrvMS: hrvMS,
+                rhrBPM: rhr,
+                sleepMinutes: window.durationMinutes,
+                hrvSampleCount: hrvValues.count,
+                baselineDayCount: baseline.dayCount,
+                baselineHRVMS: baseline.dayCount > 0 ? baseline.hrvMS : nil,
+                baselineRHRBPM: baseline.dayCount > 0 ? baseline.rhrBPM : nil,
+                baselineSleepMinutes: baseline.dayCount > 0 ? baseline.sleepMinutes : nil,
+                hrvComponent: computed?.hrvComponent ?? 0,
+                rhrComponent: computed?.rhrComponent ?? 0,
+                sleepComponent: computed?.sleepComponent ?? 0
+            )
+            modelContext.insert(created)
+            return created
+        }()
+
+        summary.score = computed?.score
+        summary.zone = (computed?.zone ?? .unavailable).rawValue
+        summary.method = RecoveryScore.method
+        summary.hrvMS = hrvMS
+        summary.rhrBPM = rhr
+        summary.sleepMinutes = window.durationMinutes
+        summary.hrvSampleCount = hrvValues.count
+        summary.baselineDayCount = baseline.dayCount
+        summary.baselineHRVMS = baseline.dayCount > 0 ? baseline.hrvMS : nil
+        summary.baselineRHRBPM = baseline.dayCount > 0 ? baseline.rhrBPM : nil
+        summary.baselineSleepMinutes = baseline.dayCount > 0 ? baseline.sleepMinutes : nil
+        summary.hrvComponent = computed?.hrvComponent ?? 0
+        summary.rhrComponent = computed?.rhrComponent ?? 0
+        summary.sleepComponent = computed?.sleepComponent ?? 0
+    }
+
+    private func backfillRecoverySummariesIfNeeded() {
+        let version = UserDefaults.standard.integer(forKey: Self.recoveryBackfillKey)
+        guard version < Self.recoveryBackfillVersion else { return }
+
+        let descriptor = FetchDescriptor<SleepWindowSummary>(
+            sortBy: [SortDescriptor(\.day)]
+        )
+        guard let windows = try? modelContext.fetch(descriptor), !windows.isEmpty else { return }
+
+        for window in windows {
+            rebuildRecoverySummary(forWakeDay: window.day)
+        }
+        try? modelContext.save()
+        UserDefaults.standard.set(Self.recoveryBackfillVersion, forKey: Self.recoveryBackfillKey)
     }
 
     private func backfillSleepWindowSummariesIfNeeded() {
@@ -2292,6 +2529,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
         try? modelContext.save()
         UserDefaults.standard.set(Self.sleepWindowBackfillVersion, forKey: Self.sleepWindowBackfillKey)
+        backfillRecoverySummariesIfNeeded()
     }
 
     private func fetchOrCreateDailySummary(for startOfDay: Date) -> DailySummary {
@@ -2385,6 +2623,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         modelContext.insert(HRVSample(timestamp: now, rmssdMS: rmssd))
         updateDailySummaryHRV(rmssd)
         updateHourlySummaryHRV(rmssd, at: now)
+        refreshSleepWindowSummariesAround(now)
         let skippedTag = skippedDiffs > 0 ? " skipped=\(skippedDiffs)" : ""
         logOK("RMSSD=\(String(format: "%.1f", rmssd))ms n=\(rrWindow.count)\(skippedTag)", tag: "HRV")
     }

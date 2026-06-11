@@ -81,9 +81,15 @@ final class MonthlySummary {
 enum MotionStillness {
     static let meanDeltaThresholdG = 0.03
     static let rmsThresholdG = 0.08
+    static let deepSleepStillFraction = 0.90
+    static let deepSleepMeanDeltaThresholdG = 0.015
 
     static func isStill(meanDeltaG: Double, rmsDeviationG: Double) -> Bool {
         meanDeltaG < meanDeltaThresholdG && rmsDeviationG < rmsThresholdG
+    }
+
+    static func isDeepStill(stillFraction: Double, avgMeanDeltaG: Double) -> Bool {
+        stillFraction >= deepSleepStillFraction && avgMeanDeltaG <= deepSleepMeanDeltaThresholdG
     }
 }
 
@@ -158,6 +164,63 @@ final class SleepWindowSummary {
         self.hrSampleCount = hrSampleCount
         self.avgHR = avgHR
         self.qualityFlags = qualityFlags
+    }
+}
+
+// Daily recovery score for the wake day. Computed from sleep-window HRV, RHR,
+// and duration vs a rolling personal baseline (WHOOP-style zones).
+@Model
+final class RecoverySummary {
+    var day: Date
+    var score: Int?
+    var zone: String
+    var method: String
+    var hrvMS: Double
+    var rhrBPM: Double
+    var sleepMinutes: Double
+    var hrvSampleCount: Int
+    var baselineDayCount: Int
+    var baselineHRVMS: Double?
+    var baselineRHRBPM: Double?
+    var baselineSleepMinutes: Double?
+    var hrvComponent: Double
+    var rhrComponent: Double
+    var sleepComponent: Double
+
+    var recoveryZone: RecoveryZone {
+        RecoveryZone(rawValue: zone) ?? .unavailable
+    }
+
+    init(day: Date,
+         score: Int?,
+         zone: RecoveryZone,
+         method: String,
+         hrvMS: Double,
+         rhrBPM: Double,
+         sleepMinutes: Double,
+         hrvSampleCount: Int,
+         baselineDayCount: Int,
+         baselineHRVMS: Double?,
+         baselineRHRBPM: Double?,
+         baselineSleepMinutes: Double?,
+         hrvComponent: Double,
+         rhrComponent: Double,
+         sleepComponent: Double) {
+        self.day = day
+        self.score = score
+        self.zone = zone.rawValue
+        self.method = method
+        self.hrvMS = hrvMS
+        self.rhrBPM = rhrBPM
+        self.sleepMinutes = sleepMinutes
+        self.hrvSampleCount = hrvSampleCount
+        self.baselineDayCount = baselineDayCount
+        self.baselineHRVMS = baselineHRVMS
+        self.baselineRHRBPM = baselineRHRBPM
+        self.baselineSleepMinutes = baselineSleepMinutes
+        self.hrvComponent = hrvComponent
+        self.rhrComponent = rhrComponent
+        self.sleepComponent = sleepComponent
     }
 }
 

@@ -9,6 +9,65 @@ enum Layout {
     static let screenHMargin: CGFloat = 20
 }
 
+/// Compact half-width score tile used on Home (Recovery, Sleep Performance, …).
+struct HomeScoreCard: View {
+    let icon: String
+    let tint: Color
+    let title: String
+    let scoreText: String
+    let unitText: String
+    var isAvailable: Bool = true
+    var showsChevron: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(tint)
+                Text(title)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(tint)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary.opacity(0.6))
+                    .opacity(showsChevron ? 1 : 0)
+            }
+            .frame(height: 18)
+
+            Group {
+                if isAvailable {
+                    HStack(alignment: .firstTextBaseline, spacing: 3) {
+                        Text(scoreText)
+                            .font(.system(size: 28, weight: .bold))
+                            .foregroundColor(.primary)
+                            .monospacedDigit()
+                        Text(unitText)
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundColor(.secondary)
+                    }
+                } else {
+                    Text("Not Available")
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .frame(height: 34, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, minHeight: Self.height, alignment: .topLeading)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(.systemGray6))
+        )
+    }
+
+    static let height: CGFloat = 112
+}
+
 enum HealthTimeRange: String, CaseIterable, Identifiable {
     case day = "D"
     case week = "W"
@@ -294,6 +353,51 @@ struct HealthDayList<Day: Identifiable, RowContent: View>: View {
             ForEach(Array(days.enumerated()), id: \.element.id) { idx, day in
                 row(day)
                 if idx < days.count - 1 {
+                    Divider().padding(.leading, 16)
+                }
+            }
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+        )
+    }
+}
+
+// Hour row for nested show-all-data navigation (day → hour → samples).
+struct HealthHourSummaryRow: View {
+    let low: Int
+    let high: Int
+    let unit: String
+    let hourStart: Date
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text("\(low)–\(high)")
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundColor(.primary)
+                Text(unit)
+                    .font(.system(size: 15))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            Text(hourStart.formatted(.dateTime.hour().minute()))
+                .font(.system(size: 15))
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+struct HealthHourList<Hour: Identifiable, RowContent: View>: View {
+    let hours: [Hour]
+    @ViewBuilder var row: (Hour) -> RowContent
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(hours.enumerated()), id: \.element.id) { idx, hour in
+                row(hour)
+                if idx < hours.count - 1 {
                     Divider().padding(.leading, 16)
                 }
             }

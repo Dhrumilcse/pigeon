@@ -21,6 +21,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "bed.double.fill", color: .purple, name: "SleepWindowSummary",
                                   subtitle: "Detected overnight sleep windows")
                 }
+                NavigationLink(destination: RecoverySummaryTableView()) {
+                    TableRowLabel(icon: "bolt.heart.fill", color: .green, name: "RecoverySummary",
+                                  subtitle: "Daily recovery scores")
+                }
                 NavigationLink(destination: MotionBucketSummaryTableView()) {
                     TableRowLabel(icon: "figure.walk.motion", color: .orange, name: "MotionBucketSummary",
                                   subtitle: "Pre-aggregated motion per chart bucket")
@@ -190,6 +194,36 @@ struct MonthlySummaryTableView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("MonthlySummary")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct RecoverySummaryTableView: View {
+    @Query(sort: \RecoverySummary.day, order: .reverse) private var rows: [RecoverySummary]
+
+    var body: some View {
+        List {
+            Section(header: Text("Rows (\(rows.count))")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.day.formatted(date: .abbreviated, time: .omitted))
+                            .font(.headline)
+                        KV("score", row.score.map { "\($0)%" } ?? "—")
+                        KV("zone", row.zone)
+                        KV("hrv", String(format: "%.1f ms", row.hrvMS))
+                        KV("rhr", String(format: "%.1f bpm", row.rhrBPM))
+                        KV("sleep", String(format: "%.0f min", row.sleepMinutes))
+                        KV("baseline_days", "\(row.baselineDayCount)")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("RecoverySummary")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

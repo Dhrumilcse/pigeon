@@ -178,7 +178,7 @@ struct ShowAllHRVDataView: View {
                 if !days.isEmpty {
                     HealthDayList(days: days) { day in
                         NavigationLink {
-                            DayHRVSamplesView(dayStart: day.date)
+                            DayHRVHoursView(dayStart: day.date)
                         } label: {
                             HealthDayLinkRow {
                                 HRVDayRow(dayStart: day.date)
@@ -469,12 +469,201 @@ private struct HRVDayRow: View {
     }
 }
 
-// MARK: - Per-day HRV samples
+// MARK: - Per-day hour list
 
-// Same cursor-paginated pattern as DayHRSamplesView. HRV samples are
-// sparser (~1/min vs HR's 1 Hz), so a single day's worth is small, but
-// keeping the pagination matches Apple Health's instant-open behavior and
-// is consistent with the HR side.
+struct DayHRVHoursView: View {
+    let dayStart: Date
+    @Query private var hours: [HourlySummary]
+
+    init(dayStart: Date) {
+        self.dayStart = dayStart
+        let end = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) ?? dayStart
+        _hours = Query(
+            filter: #Predicate<HourlySummary> {
+                $0.hourStart >= dayStart && $0.hourStart < end && $0.hrvSampleCount > 0
+            },
+            sort: \.hourStart,
+            order: .reverse
+        )
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                if hours.isEmpty {
+                    Text("No samples recorded.")
+                        .font(.system(size: 17))
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(20)
+                        .background(
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                                .fill(Color(.secondarySystemGroupedBackground))
+                        )
+                } else {
+                    HealthHourList(hours: hours) { hour in
+                        NavigationLink {
+                            HourHRVSamplesView(hourStart: hour.hourStart)
+                        } label: {
+                            HealthDayLinkRow {
+                                HRVHourRow(hourStart: hour.hourStart)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle(dayStart.formatted(.dateTime.weekday(.wide).month(.abbreviated).day()))
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct HRVHourRow: View {
+    let hourStart: Date
+    @Environment(\.modelContext) private var modelContext
+    @State private var bounds: (low: Int, high: Int)?
+    @State private var hasLoadedBounds = false
+
+    private var hourEnd: Date {
+        Calendar.current.date(byAdding: .hour, value: 1, to: hourStart) ?? hourStart
+    }
+
+    var body: some View {
+        Group {
+            if let bounds {
+                HealthHourSummaryRow(low: bounds.low, high: bounds.high, unit: "ms", hourStart: hourStart)
+            } else {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("—")
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Text(hourStart.formatted(.dateTime.hour().minute()))
+                        .font(.system(size: 15))
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .task {
+            loadBoundsIfNeeded()
+        }
+    }
+
+    private func loadBoundsIfNeeded() {
+        guard !hasLoadedBounds else { return }
+        hasLoadedBounds = true
+
+        let start = hourStart
+        let end = hourEnd
+
+        var lowDescriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.rmssdMS)]
+        )
+        lowDescriptor.fetchLimit = 1
+
+        var highDescriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < end },
+            sortBy: [SortDescriptor(\.rmssdMS, order: .reverse)]
+        )
+        highDescriptor.fetchLimit = 1
+
+        guard let low = try? modelContext.fetch(lowDescriptor).first,
+              let high = try? modelContext.fetch(highDescriptor).first else {
+            return
+        }
+        bounds = (
+            low: Int(low.rmssdMS.rounded()),
+            high: Int(high.rmssdMS.rounded())
+        )
+    }
+}
+
+// MARK: - Per-hour HRV samples
+
+struct HourHRVSamplesView: View {
+    let hourStart: Date
+    @Environment(\.modelContext) private var modelContext
+    @State private var samples: [HRVSample] = []
+    @State private var hasMore: Bool = true
+    @State private var isLoading: Bool = false
+
+    private let pageSize = 100
+
+    private var hourEnd: Date {
+        Calendar.current.date(byAdding: .hour, value: 1, to: hourStart) ?? hourStart
+    }
+
+    var body: some View {
+        List {
+            if samples.isEmpty && !hasMore {
+                Section {
+                    Text("No samples recorded.")
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Section {
+                    ForEach(samples) { sample in
+                        HealthSampleRow(
+                            value: Int(sample.rmssdMS.rounded()),
+                            unit: "ms",
+                            date: sample.timestamp
+                        )
+                        .onAppear {
+                            if sample.persistentModelID == samples.last?.persistentModelID {
+                                loadMore()
+                            }
+                        }
+                    }
+                    if hasMore {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Spacer()
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle(hourStart.formatted(.dateTime.hour().minute()))
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if samples.isEmpty && hasMore {
+                loadMore()
+            }
+        }
+    }
+
+    private func loadMore() {
+        guard !isLoading, hasMore else { return }
+        isLoading = true
+        defer { isLoading = false }
+
+        let cursor = samples.last?.timestamp ?? hourEnd
+        let start = hourStart
+
+        var descriptor = FetchDescriptor<HRVSample>(
+            predicate: #Predicate<HRVSample> { $0.timestamp >= start && $0.timestamp < cursor },
+            sortBy: [SortDescriptor(\.timestamp, order: .reverse)]
+        )
+        descriptor.fetchLimit = pageSize
+
+        do {
+            let page = try modelContext.fetch(descriptor)
+            samples.append(contentsOf: page)
+            hasMore = page.count == pageSize
+        } catch {
+            hasMore = false
+        }
+    }
+}
+
+// MARK: - Per-day HRV samples (legacy — prefer hour drill-down)
+
 struct DayHRVSamplesView: View {
     let dayStart: Date
     @Environment(\.modelContext) private var modelContext

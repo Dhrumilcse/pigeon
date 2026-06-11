@@ -46,6 +46,18 @@ struct SettingsView: View {
                     } label: {
                         SettingsRow(icon: "moon.zzz.fill", iconColor: .indigo, title: "Sleep Window")
                     }
+
+                    NavigationLink {
+                        RHRAboutView()
+                    } label: {
+                        SettingsRow(icon: "heart.text.square.fill", iconColor: .pink, title: "Resting Heart Rate")
+                    }
+
+                    NavigationLink {
+                        RecoveryAboutView()
+                    } label: {
+                        SettingsRow(icon: "bolt.heart.fill", iconColor: .green, title: "Recovery")
+                    }
                 }
 
                 Section {
@@ -747,7 +759,7 @@ struct SleepWindowAboutView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("Pigeon detects the main overnight sleep window as the longest high-confidence rest period that ends on the wake day. It is currently a sleep/rest window detector, not a sleep-stage classifier.")
 
-                    Text("The detector starts from 10-minute motion summary buckets so it can stay fast. For each wake day, it searches from the previous evening through late morning, marks quiet buckets, merges short restless gaps, refines the edges with raw motion, and then uses heart rate as a confirmation signal.")
+                    Text("The detector starts from 10-minute motion summary buckets so it can stay fast. For each wake day, it searches from the previous evening through late morning, marks quiet buckets, merges short restless gaps, then refines edges to approximate asleep-to-awake rather than in-bed-to-out-of-bed.")
 
                     CalculationStep(title: "Search window", text: "For a given wake day, scan motion buckets from 6 hours before midnight through 14 hours after midnight. This catches sleep that starts the night before and ends in the morning.")
 
@@ -755,13 +767,15 @@ struct SleepWindowAboutView: View {
 
                     CalculationStep(title: "Candidate windows", text: "Consecutive still buckets are merged into candidate windows. Short restless gaps up to 20 minutes are allowed so brief movement does not split the night. Candidates shorter than 60 minutes are ignored.")
 
-                    CalculationStep(title: "Edge refinement", text: "For each candidate, Pigeon scans raw motion near the coarse start and end. It uses 3-minute rolling stillness windows to tighten the motion boundary, then can move the start later until heart rate and stillness remain settled for 15 minutes.")
+                    CalculationStep(title: "Sleep onset", text: "Raw motion finds in-bed stillness first. Pigeon then scans forward for asleep onset using HRV (RMSSD sustained 15% above the first 20 in-bed minutes) and/or deep stillness (90%+ still samples with lower movement). When both signals fire, the later timestamp wins so scrolling in bed does not count as sleep.")
+
+                    CalculationStep(title: "Wake time", text: "Raw motion finds out-of-bed movement near the coarse end. Pigeon also scans for a sustained heart-rate rise above the middle-third sleep baseline and uses the earlier of the two as wake time.")
 
                     CalculationStep(title: "Heart-rate check", text: "For each candidate, Pigeon compares the average heart rate inside the window against the median heart rate across the full overnight search period. Lower, steady heart rate improves confidence.")
 
                     CalculationStep(title: "Final score", text: "Candidates are scored using duration, stillness density, heart-rate confirmation, and overlap with the expected overnight period. The highest-confidence candidate becomes the stored SleepWindowSummary row.")
 
-                    Text("The first pass still uses 10-minute buckets, but only the candidate edges scan raw motion. This keeps the detector efficient while reducing the 10-minute bucket-boundary fuzz.")
+                    Text("Quality flags on each stored window note which refinements applied, such as hrv_onset_refined, deep_still_onset_refined, onset_dual_signal, hr_wake_refined, or onset_unrefined when neither onset signal was available.")
                 }
                 .font(.system(size: 17))
                 .foregroundColor(.primary)
@@ -818,9 +832,17 @@ for each wake_day:
     discard windows shorter than 60 minutes
 
   for each candidate:
-    refine start with raw motion near coarse start
-    refine start later until HR + stillness settle for 15m
-    refine end with raw motion near coarse end
+    in_bed_start = raw motion stillness near coarse start
+
+    scan up to 90m after in_bed_start:
+      hrv_onset = RMSSD >= 115% of in-bed baseline for 10m
+      deep_still_onset = 90%+ still in 3m rolling window
+      asleep_start = later of hrv_onset and deep_still_onset
+                   (or whichever signal is available)
+
+    motion_end = raw motion still→moving transition near coarse end
+    hr_wake = sustained HR rise above sleep baseline near coarse end
+    wake_time = earlier of motion_end and hr_wake
 
   baseline_hr = median HR across search window
 
@@ -835,6 +857,172 @@ for each wake_day:
       overnight_overlap_score * 15%
 
   store the highest-scoring candidate
+"""
+}
+
+// MARK: - About Resting Heart Rate
+
+struct RHRAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Resting Heart Rate")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Resting heart rate (RHR) is your heart rate when your body is fully at rest. It is most useful as a personal baseline you track over time, not as a single daytime reading that can be skewed by movement, caffeine, or stress.")
+
+                    Text("Pigeon v1 computes RHR from heart-rate samples inside the detected sleep window for each wake day. It uses an unweighted mean — not WHOOP's slow-wave-sleep-weighted average.")
+
+                    CalculationStep(title: "Sleep window required", text: "RHR is only computed when Pigeon has a high-confidence SleepWindowSummary for the wake day. Low-confidence windows, such as short evening naps, are excluded.")
+
+                    CalculationStep(title: "Sample window", text: "Collect every HR sample with a timestamp inside the refined sleep window start and end times stored on that wake day's summary row.")
+
+                    CalculationStep(title: "Formula", text: "RHR = mean(HR samples inside sleep window). The result is rounded to the nearest whole BPM for display.")
+
+                    CalculationStep(title: "Confidence gate", text: "avgHR is stored only when sleep-window confidence is at least 60%. Windows below that threshold keep duration and timing but do not publish an RHR value.")
+
+                    Text("WHOOP weights heart rate more heavily during deep sleep for a steadier nightly baseline. Pigeon may add that weighting later; for now the sleep-window mean is a simple, transparent estimate from the same local HR samples already on your phone.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Core Logic")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text(Self.pseudocode)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color(.tertiarySystemGroupedBackground))
+                        )
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Resting Heart Rate")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private static let pseudocode = """
+for each wake_day:
+  window = highest-confidence SleepWindowSummary for wake_day
+
+  if window.confidence < 60%:
+    skip RHR for this day
+
+  samples = HR samples where window.start <= t < window.end
+
+  if samples is empty:
+    skip RHR for this day
+
+  RHR = mean(samples)
+  store rounded RHR on SleepWindowSummary.avgHR
+"""
+}
+
+// MARK: - About Recovery
+
+struct RecoveryAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Recovery")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Recovery is a daily 1–100% score for how ready your body is to take on strain. Like WHOOP, Pigeon compares last night's physiology to your personal baseline — not to other people.")
+
+                    Text("This is Pigeon's transparent v1 model using the same inputs we can measure locally. It is not WHOOP's proprietary algorithm, and it does not use respiratory rate or skin temperature.")
+
+                    CalculationStep(title: "Baseline required", text: "Recovery stays unavailable until at least four prior nights with valid sleep-window HRV exist. The home card shows progress as 2/4 while the baseline is building.")
+
+                    CalculationStep(title: "Nightly inputs", text: "Mean RMSSD (HRV) inside the detected sleep window, mean HR (RHR) inside that window, and total sleep duration in minutes.")
+
+                    CalculationStep(title: "Personal baseline", text: "Median HRV, RHR, and sleep duration from the prior 21 wake days with valid nightly metrics.")
+
+                    CalculationStep(title: "Component weights", text: "HRV vs baseline 60%, RHR vs baseline 25%, sleep duration vs baseline 15%. Higher HRV and lower RHR than baseline increase the score.")
+
+                    CalculationStep(title: "Zones", text: "Green 67–100% — ready for high strain. Yellow 34–66% — moderate strain. Red 1–33% — prioritize rest. These match WHOOP's zone cutoffs.")
+
+                    Text("Better sleep-window detection (v4 HRV + deep-still onset, HR wake) directly improves Recovery because all three inputs are measured inside that window.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Core Logic")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text(Self.pseudocode)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color(.tertiarySystemGroupedBackground))
+                        )
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Recovery")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private static let pseudocode = """
+for each wake_day:
+  window = high-confidence SleepWindowSummary
+
+  nightly_hrv = mean(HRV samples in window)
+  nightly_rhr = mean(HR samples in window)
+  nightly_sleep = window.durationMinutes
+
+  baseline = median of prior 21 days (min 4 days)
+
+  hrv_score   = map(nightly_hrv / baseline_hrv)     × 60%
+  rhr_score   = map(baseline_rhr / nightly_rhr)     × 25%
+  sleep_score = min(nightly_sleep / baseline_sleep, 1) × 15%
+
+  recovery = clamp(1, 100, round(combined × 100))
+  zone = green if ≥67, yellow if ≥34, else red
 """
 }
 
