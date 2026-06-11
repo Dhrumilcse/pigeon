@@ -19,6 +19,7 @@
 		A1000000000000000000000B /* HeartRateViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000B /* HeartRateViews.swift */; };
 		A1000000000000000000000C /* HealthChartShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000C /* HealthChartShared.swift */; };
 		A1000000000000000000000D /* HRVViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* HRVViews.swift */; };
+		A1000000000000000000000E /* RHRViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000E /* RHRViews.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		A2000000000000000000000B /* HeartRateViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HeartRateViews.swift; sourceTree = "<group>"; };
 		A2000000000000000000000C /* HealthChartShared.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthChartShared.swift; sourceTree = "<group>"; };
 		A2000000000000000000000D /* HRVViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HRVViews.swift; sourceTree = "<group>"; };
+		A2000000000000000000000E /* RHRViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RHRViews.swift; sourceTree = "<group>"; };
 		A30000000000000000000001 /* Pigeon.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Pigeon.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -71,6 +73,7 @@
 				A2000000000000000000000B /* HeartRateViews.swift */,
 				A2000000000000000000000C /* HealthChartShared.swift */,
 				A2000000000000000000000D /* HRVViews.swift */,
+				A2000000000000000000000E /* RHRViews.swift */,
 				A20000000000000000000003 /* Assets.xcassets */,
 				A40000000000000000000001 /* Info.plist */,
 			);
@@ -159,6 +162,7 @@
 				A1000000000000000000000B /* HeartRateViews.swift in Sources */,
 				A1000000000000000000000C /* HealthChartShared.swift in Sources */,
 				A1000000000000000000000D /* HRVViews.swift in Sources */,
+				A1000000000000000000000E /* RHRViews.swift in Sources */,
 				A10000000000000000000001 /* PigeonApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
