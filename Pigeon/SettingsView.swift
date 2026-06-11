@@ -58,6 +58,12 @@ struct SettingsView: View {
                     } label: {
                         SettingsRow(icon: "bolt.heart.fill", iconColor: .green, title: "Recovery")
                     }
+
+                    NavigationLink {
+                        StrainAboutView()
+                    } label: {
+                        SettingsRow(icon: "flame.fill", iconColor: .orange, title: "Strain")
+                    }
                 }
 
                 Section {
@@ -1023,6 +1029,94 @@ for each wake_day:
 
   recovery = clamp(1, 100, round(combined × 100))
   zone = green if ≥67, yellow if ≥34, else red
+"""
+}
+
+// MARK: - About Strain
+
+struct StrainAboutView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                Text("About Strain")
+                    .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 4)
+
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("Strain is a daily 0–21 cardiovascular load score. Like WHOOP, it rises when your heart rate stays elevated for longer — but Pigeon uses a transparent local model built from HR samples already stored on your phone.")
+
+                    Text("This is not WHOOP's proprietary strain algorithm. Pigeon approximates daily load with a heart-rate-reserve TRIMP-style model using fixed resting (60 BPM) and max (190 BPM) fallbacks until personal HR zones are wired in.")
+
+                    CalculationStep(title: "Daily window", text: "Each calendar day gets one DailyStrainSummary row. Every heart-rate sample that day contributes load based on how long it has been since the previous sample.")
+
+                    CalculationStep(title: "Sample gaps", text: "Time between consecutive samples is capped at 120 seconds so long disconnect gaps do not inflate strain. The first sample of the day contributes zero duration.")
+
+                    CalculationStep(title: "Intensity", text: "For each interval, intensity = (HR − 60) / (190 − 60), clamped between 0 and 1.5. Higher heart rate above resting reserve adds more load per minute.")
+
+                    CalculationStep(title: "Load increment", text: "interval_load = intensity^1.67 × (seconds / 60). Exponent 1.67 matches common TRIMP weighting so moderate efforts accumulate faster than light activity.")
+
+                    CalculationStep(title: "Daily score", text: "Summed load is mapped to 0–21 with score = 21 × (1 − e^(−load / 55)), capped at 21. The curve saturates so very long hard days approach but rarely exceed 21.")
+
+                    CalculationStep(title: "Zones", text: "Light 0–9.9, Moderate 10–13.9, High 14–17.9, All Out 18–21. These match WHOOP's public strain zone cutoffs.")
+
+                    Text("Live HR updates the current day incrementally; historical sync and startup backfill rebuild past days from stored HRSample rows.")
+                }
+                .font(.system(size: 17))
+                .foregroundColor(.primary)
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Core Logic")
+                        .font(.system(size: 20, weight: .semibold))
+                    Text(Self.pseudocode)
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .padding(14)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                .fill(Color(.tertiarySystemGroupedBackground))
+                        )
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .fill(Color(.secondarySystemGroupedBackground))
+                )
+            }
+            .padding(.horizontal, Layout.screenHMargin)
+            .padding(.vertical, 20)
+        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("Strain")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    private static let pseudocode = """
+for each calendar day:
+  summary = DailyStrainSummary for day
+  samples = HR samples ordered by timestamp
+
+  for each sample after the first:
+    dt = min(seconds since previous sample, 120)
+    intensity = clamp((HR - 60) / (190 - 60), 0, 1.5)
+    load += intensity^1.67 × (dt / 60)
+
+  score = min(21, 21 × (1 - exp(-load / 55)))
+
+  zone =
+    Light     if score < 10
+    Moderate  if score < 14
+    High      if score < 18
+    All Out   otherwise
 """
 }
 
