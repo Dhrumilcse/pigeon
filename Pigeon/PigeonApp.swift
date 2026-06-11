@@ -8,6 +8,8 @@ struct PigeonApp: App {
     init() {
         do {
             modelContainer = try ModelContainer(for: HRSample.self, RRSample.self, HRVSample.self,
+                                                    SkinTemperatureSample.self,
+                                                    SkinTemperatureHourlySummary.self,
                                                     MotionSample.self, MotionBucketSummary.self,
                                                     SleepWindowSummary.self, RecoverySummary.self,
                                                     HourlySummary.self, DailySummary.self,

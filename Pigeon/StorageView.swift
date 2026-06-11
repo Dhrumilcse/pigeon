@@ -48,6 +48,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "figure.walk.motion", color: .orange, name: "MotionSample",
                                   subtitle: "Compact Raw43 accelerometer aggregates")
                 }
+                NavigationLink(destination: SkinTemperatureSampleTableView()) {
+                    TableRowLabel(icon: "thermometer", color: .pink, name: "SkinTemperatureSample",
+                                  subtitle: "WHOOP historical temperature candidates")
+                }
             } header: { Text("Raw Samples") }
         }
         .listStyle(.insetGrouped)
@@ -469,6 +473,51 @@ struct MotionSampleTableView: View {
         )
         descriptor.fetchLimit = 100
         rows = (try? modelContext.fetch(descriptor)) ?? []
+    }
+}
+
+struct SkinTemperatureSampleTableView: View {
+    @Query(sort: \SkinTemperatureSample.timestamp, order: .reverse) private var rows: [SkinTemperatureSample]
+
+    private static let schema: [(String, String)] = [
+        ("timestamp",     "Date — historical packet timestamp from the strap"),
+        ("celsius",       "Double? — decoded temperature candidate"),
+        ("packetK",       "Int — source historical packet family"),
+        ("schemaField",   "String — candidate mapping name from Goose"),
+        ("rawBodyOffset", "Int — byte offset within Pigeon's WHOOP payload"),
+        ("encoding",      "String — integer encoding and scale"),
+        ("rawHex",        "String — original two bytes"),
+        ("rawI16LE",      "Int? — signed little-endian interpretation"),
+        ("rawU16LE",      "Int? — unsigned little-endian interpretation"),
+        ("semanticStatus","String — validation status"),
+        ("sourceKey",     "String — packet/page dedupe key"),
+    ]
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Last 100 of \(rows.count)")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows.prefix(100)) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(row.timestamp.formatted(date: .abbreviated, time: .standard))
+                            .font(.headline.monospacedDigit())
+                        KV("temp", row.celsius.map { String(format: "%.2f C", $0) } ?? "—")
+                        KV("packet", "K\(row.packetK)")
+                        KV("field", row.schemaField)
+                        KV("encoding", "\(row.encoding) payload+\(row.rawBodyOffset)")
+                        KV("raw", "\(row.rawHex) i16=\(row.rawI16LE.map(String.init) ?? "?") u16=\(row.rawU16LE.map(String.init) ?? "?")")
+                        KV("status", row.semanticStatus)
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("SkinTemperatureSample")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

@@ -54,6 +54,34 @@ final class HourlySummary {
     }
 }
 
+// Pre-aggregated skin temperature summary. Kept separate from HourlySummary
+// because this stream is historical-only and still carries raw-register data.
+@Model
+final class SkinTemperatureHourlySummary {
+    var hourStart: Date
+    var sampleCount: Int
+    var sumCelsius: Double
+    var minCelsius: Double
+    var maxCelsius: Double
+    var sumRawU16: Double
+    var minRawU16: Int
+    var maxRawU16: Int
+
+    var avgCelsius: Double? { sampleCount > 0 ? sumCelsius / Double(sampleCount) : nil }
+    var avgRawU16: Double? { sampleCount > 0 ? sumRawU16 / Double(sampleCount) : nil }
+
+    init(hourStart: Date) {
+        self.hourStart = hourStart
+        self.sampleCount = 0
+        self.sumCelsius = 0
+        self.minCelsius = 0
+        self.maxCelsius = 0
+        self.sumRawU16 = 0
+        self.minRawU16 = 0
+        self.maxRawU16 = 0
+    }
+}
+
 // Pre-aggregated monthly summary. One row per calendar month.
 // Recomputed from the daily rows for that month (≤31 fetches) whenever
 // a daily summary changes — far cheaper than scanning raw samples.
@@ -265,6 +293,50 @@ final class HRVSample {
     init(timestamp: Date, rmssdMS: Double) {
         self.timestamp = timestamp
         self.rmssdMS = rmssdMS
+    }
+}
+
+// Candidate skin-temperature reading decoded from WHOOP historical packets.
+// Units/semantics are intentionally marked in `semanticStatus` until validated
+// against official WHOOP recovery exports or app-visible skin temperature.
+@Model
+final class SkinTemperatureSample {
+    var timestamp: Date
+    var celsius: Double?
+    var packetK: Int
+    var schemaField: String
+    var rawBodyOffset: Int
+    var encoding: String
+    var rawHex: String
+    var rawI16LE: Int?
+    var rawU16LE: Int?
+    var semanticStatus: String
+    var sourceKey: String
+
+    init(
+        timestamp: Date,
+        celsius: Double?,
+        packetK: Int,
+        schemaField: String,
+        rawBodyOffset: Int,
+        encoding: String,
+        rawHex: String,
+        rawI16LE: Int?,
+        rawU16LE: Int?,
+        semanticStatus: String,
+        sourceKey: String
+    ) {
+        self.timestamp = timestamp
+        self.celsius = celsius
+        self.packetK = packetK
+        self.schemaField = schemaField
+        self.rawBodyOffset = rawBodyOffset
+        self.encoding = encoding
+        self.rawHex = rawHex
+        self.rawI16LE = rawI16LE
+        self.rawU16LE = rawU16LE
+        self.semanticStatus = semanticStatus
+        self.sourceKey = sourceKey
     }
 }
 

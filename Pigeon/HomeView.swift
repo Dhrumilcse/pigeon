@@ -99,7 +99,7 @@ private struct HomeHeader: View {
 
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 30)) { context in
-            HStack(alignment: .top, spacing: 12) {
+            HStack(alignment: .center, spacing: 12) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Home")
                         .font(.system(size: 34, weight: .bold))
@@ -112,7 +112,6 @@ private struct HomeHeader: View {
 
                 if bluetooth.connectionState == .connected {
                     LiveHRPill(bpm: bluetooth.currentHeartRate)
-                        .padding(.top, 5)
                 }
             }
         }
@@ -175,7 +174,7 @@ private struct LiveHRPill: View {
                 .foregroundColor(.red)
             Text(bpm.map { "\($0)" } ?? "—")
                 .font(.system(size: 22, weight: .semibold, design: .rounded))
-                .foregroundColor(.primary)
+                .foregroundColor(.secondary)
                 .monospacedDigit()
         }
     }

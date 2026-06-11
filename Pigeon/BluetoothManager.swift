@@ -99,6 +99,7 @@ class BluetoothManager: NSObject, ObservableObject {
     // timer fires (or HistoryComplete arrives) signalling the strap is empty.
     @Published private(set) var historicalSyncInProgress = false
     @Published private(set) var historicalSyncPackets = 0
+    @Published private(set) var historicalTemperaturePackets = 0
     @Published private(set) var lastHistoricalSyncAt: Date?
     private var historyEndAckedThisBatch = false
     private var historicalUnsavedSincePersist = 0
@@ -109,6 +110,11 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let historicalIdleSeconds: TimeInterval = 3
     private static let autoHistoricalSyncDelay: TimeInterval = 1.5
     private static let lastHistoricalSyncKey = "pigeon.lastHistoricalSyncAt"
+    private static let skinTemperatureCleanupKey = "pigeon.skinTemperatureCleanupVersion"
+    private static let skinTemperatureCleanupVersion = 2
+    private static let skinTemperatureHourlyBackfillKey = "pigeon.skinTemperatureHourlyBackfillVersion"
+    private static let skinTemperatureHourlyBackfillVersion = 1
+    private static let skinTemperatureSchemaField = "whoop5_v18_frame_73_skin_temp_raw"
 
     // Step 2a — dump one K=18 body hex per drain so we can keep eyeballing
     // header layout vs Goose's protocol.rs:496-510 if anything looks off.
@@ -207,6 +213,8 @@ class BluetoothManager: NSObject, ObservableObject {
         backfillMotionBucketSummariesIfNeeded()
         backfillSleepWindowSummariesIfNeeded()
         backfillRecoverySummariesIfNeeded()
+        purgeImplausibleSkinTemperatureSamplesIfNeeded()
+        backfillSkinTemperatureHourlySummariesIfNeeded()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
@@ -427,6 +435,7 @@ class BluetoothManager: NSObject, ObservableObject {
         logTX("SEND_HISTORICAL_DATA seq=\(seq)", tag: "SYNC", hex: hexStr)
         historicalSyncInProgress = true
         historicalSyncPackets = 0
+        historicalTemperaturePackets = 0
         historyEndAckedThisBatch = false
         historicalUnsavedSincePersist = 0
         historicalTouchedHours.removeAll()
@@ -521,6 +530,120 @@ class BluetoothManager: NSObject, ObservableObject {
         scheduleHistoricalIdleFinalize()
     }
 
+    private struct HistoricalSkinTemperatureCandidate {
+        let packetK: Int
+        let schemaField: String
+        let rawBodyOffset: Int
+        let encoding: String
+        let rawHex: String
+        let rawI16LE: Int?
+        let rawU16LE: Int?
+        let celsius: Double
+        let semanticStatus: String
+    }
+
+    private func ingestHistoricalSkinTemperature(payload: [UInt8], packetK: Int) {
+        guard let page = Self.u32LE(payload, offset: 3),
+              let timestampSeconds = Self.u32LE(payload, offset: 7),
+              let candidate = Self.parseHistoricalSkinTemperature(payload: payload, packetK: packetK),
+              candidate.semanticStatus == "plausible_unverified_scale" else {
+            return
+        }
+
+        let key = "temp:k\(packetK):\(page):\(candidate.schemaField)"
+        let descriptor = FetchDescriptor<SkinTemperatureSample>(
+            predicate: #Predicate { $0.sourceKey == key }
+        )
+        if let existingCount = try? modelContext.fetchCount(descriptor), existingCount > 0 {
+            return
+        }
+
+        let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampSeconds))
+        modelContext.insert(SkinTemperatureSample(
+            timestamp: timestamp,
+            celsius: candidate.celsius,
+            packetK: candidate.packetK,
+            schemaField: candidate.schemaField,
+            rawBodyOffset: candidate.rawBodyOffset,
+            encoding: candidate.encoding,
+            rawHex: candidate.rawHex,
+            rawI16LE: candidate.rawI16LE,
+            rawU16LE: candidate.rawU16LE,
+            semanticStatus: candidate.semanticStatus,
+            sourceKey: key
+        ))
+        updateSkinTemperatureHourlySummary(celsius: candidate.celsius, rawU16: candidate.rawU16LE, at: timestamp)
+
+        historicalTemperaturePackets += 1
+        historicalUnsavedSincePersist += 1
+
+        if historicalUnsavedSincePersist >= Self.historicalSaveChunkSize {
+            try? modelContext.save()
+            historicalUnsavedSincePersist = 0
+        }
+        scheduleHistoricalIdleFinalize()
+    }
+
+    private static func parseHistoricalSkinTemperature(
+        payload: [UInt8],
+        packetK: Int
+    ) -> HistoricalSkinTemperatureCandidate? {
+        guard payload.count >= 13 else { return nil }
+
+        let schemaField: String
+        let rawBodyOffset: Int
+        let encoding: String
+        let scale: Double
+        let signed: Bool
+
+        switch packetK {
+        case 18:
+            schemaField = Self.skinTemperatureSchemaField
+            // Noop's WHOOP5 v18 decoder maps skin_temp_raw at full-frame
+            // offset 73. Pigeon passes the inner payload beginning at full
+            // frame offset 8, so the payload-relative offset is 65.
+            rawBodyOffset = 65
+            encoding = "u16_le_as6221_raw_x128_candidate"
+            scale = 128.0
+            signed = false
+        default:
+            return nil
+        }
+
+        let absoluteOffset = rawBodyOffset
+        guard let rawU16 = u16LE(payload, offset: absoluteOffset),
+              let rawI16 = i16LE(payload, offset: absoluteOffset) else {
+            return nil
+        }
+
+        let signedValue = Int(rawI16)
+        let unsignedValue = Int(rawU16)
+        let celsius = signed ? Double(signedValue) / scale : Double(unsignedValue) / scale
+        let rawHex = "\(String(format: "%02x", payload[absoluteOffset])) \(String(format: "%02x", payload[absoluteOffset + 1]))"
+
+        return HistoricalSkinTemperatureCandidate(
+            packetK: packetK,
+            schemaField: schemaField,
+            rawBodyOffset: rawBodyOffset,
+            encoding: encoding,
+            rawHex: rawHex,
+            rawI16LE: signedValue,
+            rawU16LE: unsignedValue,
+            celsius: celsius,
+            semanticStatus: skinTemperatureSemanticStatus(for: celsius)
+        )
+    }
+
+    private static func skinTemperatureSemanticStatus(for celsius: Double) -> String {
+        if celsius == 0 {
+            return "zero_candidate_unresolved"
+        }
+        if (5.0...45.0).contains(celsius) {
+            return "plausible_unverified_scale"
+        }
+        return "outside_plausible_sensor_temperature_range"
+    }
+
     // Reset the "strap went quiet" timer. We can't trust HistoryComplete to
     // arrive (Step 1 + 2b runs showed it doesn't on this firmware), so this
     // idle window is our actual end-of-stream signal. Called after every K=18
@@ -590,6 +713,9 @@ class BluetoothManager: NSObject, ObservableObject {
         lastHistoricalSyncAt = completedAt
         UserDefaults.standard.set(completedAt, forKey: Self.lastHistoricalSyncKey)
         logOK("Historical sync complete — \(packets) HR samples, \(hours.count) hours, \(days.count) days, \(months.count) months", tag: "SYNC")
+        if historicalTemperaturePackets > 0 {
+            logOK("Historical temperature candidates — \(historicalTemperaturePackets) stored (units unverified)", tag: "SYNC")
+        }
     }
 
     // Rebuild a HourlySummary row from every HRSample inside [hourStart, +1h).
@@ -1095,8 +1221,13 @@ extension BluetoothManager: CBPeripheralDelegate {
                 awaitingFirstK18Dump = false
                 dumpFirstK18ForVerification(payload: payload)
             }
-            if k == 18, historicalSyncInProgress {
-                ingestHistoricalK18(payload: payload)
+            if historicalSyncInProgress {
+                if k == 18 {
+                    ingestHistoricalK18(payload: payload)
+                }
+                if k == 18 {
+                    ingestHistoricalSkinTemperature(payload: payload, packetK: Int(k))
+                }
             }
         case 0x31:
             // METADATA — payload[2] is the kind (1=HistoryStart, 2=HistoryEnd,
@@ -2499,6 +2630,26 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
         try? modelContext.save()
         UserDefaults.standard.set(Self.recoveryBackfillVersion, forKey: Self.recoveryBackfillKey)
+    }
+
+    private func purgeImplausibleSkinTemperatureSamplesIfNeeded() {
+        let version = UserDefaults.standard.integer(forKey: Self.skinTemperatureCleanupKey)
+        guard version < Self.skinTemperatureCleanupVersion else { return }
+
+        let descriptor = FetchDescriptor<SkinTemperatureSample>(
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        let rows = (try? modelContext.fetch(descriptor)) ?? []
+        var deleted = 0
+        for row in rows where row.semanticStatus != "plausible_unverified_scale" || row.schemaField != Self.skinTemperatureSchemaField {
+            modelContext.delete(row)
+            deleted += 1
+        }
+        if deleted > 0 {
+            try? modelContext.save()
+            logInfo("Removed \(deleted) implausible skin temperature candidate\(deleted == 1 ? "" : "s")", tag: "SYNC")
+        }
+        UserDefaults.standard.set(Self.skinTemperatureCleanupVersion, forKey: Self.skinTemperatureCleanupKey)
     }
 
     private func backfillSleepWindowSummariesIfNeeded() {
