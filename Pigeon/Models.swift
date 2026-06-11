@@ -116,6 +116,10 @@ final class MotionBucketSummary {
     }
 }
 
+enum SleepWindowDetection {
+    static let minimumConfidence = 0.60
+}
+
 // Detected main overnight sleep/rest window. The `day` is the local wake day
 // (midnight at the date the window ends), not necessarily the date it starts.
 @Model

@@ -33,6 +33,13 @@ struct HomeView: View {
                             .buttonStyle(.plain)
 
                             NavigationLink {
+                                RHRDetailView()
+                            } label: {
+                                RHRCard()
+                            }
+                            .buttonStyle(.plain)
+
+                            NavigationLink {
                                 HRVDetailView()
                             } label: {
                                 HRVCard()
@@ -206,10 +213,20 @@ private enum SleepWindowRange: String, CaseIterable, Identifiable {
 }
 
 struct SleepWindowCard: View {
-    @Query(sort: \SleepWindowSummary.day, order: .reverse) private var rows: [SleepWindowSummary]
+    @Query private var todayRows: [SleepWindowSummary]
 
-    private var latest: SleepWindowSummary? {
-        rows.first
+    init() {
+        let todayStart = Calendar.current.startOfDay(for: Date())
+        let minimumConfidence = SleepWindowDetection.minimumConfidence
+        _todayRows = Query(
+            filter: #Predicate<SleepWindowSummary> {
+                $0.day == todayStart && $0.confidence >= minimumConfidence
+            }
+        )
+    }
+
+    private var today: SleepWindowSummary? {
+        todayRows.first
     }
 
     var body: some View {
@@ -255,13 +272,13 @@ struct SleepWindowCard: View {
     }
 
     private var dateText: String {
-        latest?.day.formatted(.dateTime.month(.abbreviated).day()) ?? Date().formatted(.dateTime.month(.abbreviated).day())
+        Date().formatted(.dateTime.month(.abbreviated).day())
     }
 
     @ViewBuilder
     private var durationValue: some View {
-        if let latest {
-            let parts = SleepWindowFormat.durationParts(minutes: latest.durationMinutes)
+        if let today {
+            let parts = SleepWindowFormat.durationParts(minutes: today.durationMinutes)
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text("\(parts.hours)")
                     .font(.system(size: 34, weight: .bold))
@@ -287,9 +304,9 @@ struct SleepWindowCard: View {
 
     @ViewBuilder
     private var windowValue: some View {
-        if let latest {
+        if let today {
             VStack(alignment: .trailing, spacing: 2) {
-                windowTimeText(latest.start)
+                windowTimeText(today.start)
                 HStack {
                     Spacer()
                     Rectangle()
@@ -298,7 +315,7 @@ struct SleepWindowCard: View {
                     Spacer()
                 }
                 .frame(width: 72)
-                windowTimeText(latest.end)
+                windowTimeText(today.end)
             }
         } else {
             Text("No window")

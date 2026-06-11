@@ -153,7 +153,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let rrSilenceNudgeSeconds: TimeInterval = 300
     private static let motionBucketSeconds = [10 * 60, 60 * 60, 6 * 60 * 60]
     private static let sleepWindowBackfillKey = "pigeon.sleepWindowBackfillVersion"
-    private static let sleepWindowBackfillVersion = 3
+    private static let sleepWindowBackfillVersion = 4
     private static let sleepWindowBucketSeconds = 10 * 60
     private static let sleepSearchStartOffset: TimeInterval = -6 * 60 * 60
     private static let sleepSearchEndOffset: TimeInterval = 14 * 60 * 60
@@ -1920,7 +1920,7 @@ extension BluetoothManager: CBPeripheralDelegate {
                 0.0
             ), 1.0)
 
-            if confidence < 0.60 {
+            if confidence < SleepWindowDetection.minimumConfidence {
                 flags.append("low_confidence")
             }
 
@@ -2227,7 +2227,13 @@ extension BluetoothManager: CBPeripheralDelegate {
         return (try? modelContext.fetch(descriptor))?.first
     }
 
+    private func rhrForSleepWindow(_ detected: DetectedSleepWindow) -> Double? {
+        guard detected.confidence >= SleepWindowDetection.minimumConfidence else { return nil }
+        return detected.avgHR
+    }
+
     private func upsertSleepWindowSummary(day: Date, detected: DetectedSleepWindow) {
+        let rhr = rhrForSleepWindow(detected)
         let summary = fetchSleepWindowSummary(forWakeDay: day) ?? {
             let created = SleepWindowSummary(
                 day: day,
@@ -2239,7 +2245,7 @@ extension BluetoothManager: CBPeripheralDelegate {
                 motionBucketCount: detected.motionBucketCount,
                 stillBucketCount: detected.stillBucketCount,
                 hrSampleCount: detected.hrSampleCount,
-                avgHR: detected.avgHR,
+                avgHR: rhr,
                 qualityFlags: detected.qualityFlags
             )
             modelContext.insert(created)
@@ -2254,7 +2260,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.motionBucketCount = detected.motionBucketCount
         summary.stillBucketCount = detected.stillBucketCount
         summary.hrSampleCount = detected.hrSampleCount
-        summary.avgHR = detected.avgHR
+        summary.avgHR = rhr
         summary.qualityFlags = detected.qualityFlags
     }
 
