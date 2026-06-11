@@ -72,6 +72,8 @@ private func recoveryTint(for zone: RecoveryZone) -> Color {
 struct RecoveryCard: View {
     @Query private var recentRows: [RecoverySummary]
 
+    private static let tint = Color(.systemGreen)
+
     init() {
         let cal = Calendar.current
         let todayStart = cal.startOfDay(for: Date())
@@ -100,7 +102,7 @@ struct RecoveryCard: View {
     var body: some View {
         HomeScoreCard(
             icon: "bolt.heart.fill",
-            tint: recoveryTint(for: today?.recoveryZone ?? .unavailable),
+            tint: Self.tint,
             title: "Recovery",
             scoreText: scoreValueText,
             unitText: "%",

@@ -19,7 +19,7 @@ struct HomeView: View {
 
                         VStack(spacing: 12) {
                             HStack(alignment: .top, spacing: 12) {
-                                SleepPerformanceCard()
+                                StrainCard()
                                     .frame(maxWidth: .infinity)
                                 NavigationLink {
                                     RecoveryDetailView()
@@ -77,19 +77,148 @@ struct HomeView: View {
     }
 }
 
-// MARK: - Sleep performance (placeholder)
+// MARK: - Strain
 
-struct SleepPerformanceCard: View {
-    var body: some View {
-        HomeScoreCard(
-            icon: "moon.zzz.fill",
-            tint: .indigo,
-            title: "Sleep Performance",
-            scoreText: "",
-            unitText: "",
-            isAvailable: false
+struct StrainCard: View {
+    @Query private var rows: [DailyStrainSummary]
+
+    init() {
+        let todayStart = Calendar.current.startOfDay(for: Date())
+        _rows = Query(
+            filter: #Predicate<DailyStrainSummary> { $0.date == todayStart }
         )
     }
+
+    private var today: DailyStrainSummary? {
+        rows.first
+    }
+
+    private var isAvailable: Bool {
+        (today?.sampleCount ?? 0) > 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "flame.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.orange)
+                Text("Strain")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundColor(.orange)
+                Spacer(minLength: 0)
+            }
+            .frame(height: 18)
+
+            if isAvailable, let today {
+                StrainGaugeView(score: today.score)
+                    .padding(.top, 6)
+            } else {
+                Text("Not Available")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 56, alignment: .center)
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: HomeScoreCard.height, alignment: .topLeading)
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color(.systemGray6))
+        )
+    }
+}
+
+private struct StrainGaugeView: View {
+    let score: Double
+
+    private static let barHeight: CGFloat = 13
+    private static let markerWidth: CGFloat = 2
+    private static let markerExtension: CGFloat = 5
+
+    private var category: String {
+        StrainScore.categoryLabel(for: score)
+    }
+
+    private var scoreFraction: CGFloat {
+        CGFloat(min(max(score / StrainScore.maxScore, 0), 1))
+    }
+
+    private var gaugeHeight: CGFloat {
+        Self.barHeight + 2 * Self.markerExtension
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            GeometryReader { geo in
+                let width = geo.size.width
+                let markerX = markerX(in: width)
+                let centerY = gaugeHeight / 2
+
+                ZStack {
+                    strainBar(width: width)
+                        .frame(height: Self.barHeight)
+                        .position(x: width / 2, y: centerY)
+
+                    Rectangle()
+                        .fill(Color.secondary.opacity(0.55))
+                        .frame(width: Self.markerWidth, height: gaugeHeight)
+                        .position(x: markerX, y: centerY)
+                }
+            }
+            .frame(height: gaugeHeight)
+
+            Text(category)
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(.primary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func strainBar(width: CGFloat) -> some View {
+        let max = StrainScore.maxScore
+        let boundaries = StrainScore.zones.dropLast().map(\.upperBound)
+
+        return ZStack {
+            RoundedRectangle(cornerRadius: 2, style: .continuous)
+                .fill(
+                    LinearGradient(
+                        stops: [
+                            .init(color: StrainPalette.neutral, location: 0),
+                            .init(color: StrainPalette.start, location: 1 / max),
+                            .init(color: StrainPalette.light, location: 7 / max),
+                            .init(color: StrainPalette.moderate, location: 12 / max),
+                            .init(color: StrainPalette.high, location: 17 / max),
+                            .init(color: StrainPalette.allOut, location: 1),
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                )
+
+            ForEach(boundaries, id: \.self) { boundary in
+                Rectangle()
+                    .fill(Color(.systemGray6))
+                    .frame(width: 2, height: Self.barHeight)
+                    .position(x: (boundary / max) * width, y: Self.barHeight / 2)
+            }
+        }
+        .frame(width: width, height: Self.barHeight)
+        .clipShape(RoundedRectangle(cornerRadius: 2, style: .continuous))
+    }
+
+    private func markerX(in width: CGFloat) -> CGFloat {
+        scoreFraction * width
+    }
+}
+
+private enum StrainPalette {
+    static let neutral = Color(red: 0.91, green: 0.91, blue: 0.92)
+    static let start = Color(red: 0.86, green: 0.91, blue: 0.96)
+    static let light = Color(red: 0.78, green: 0.87, blue: 0.95)
+    static let moderate = Color(red: 0.58, green: 0.72, blue: 0.86)
+    static let high = Color(red: 0.38, green: 0.56, blue: 0.76)
+    static let allOut = Color(red: 0.22, green: 0.38, blue: 0.58)
 }
 
 // MARK: - Home header
@@ -118,7 +247,7 @@ private struct HomeHeader: View {
     }
 
     private func statusText(now: Date) -> String {
-        "\(connectionText) • \(syncText(now: now))"
+        "\(connectionText) • \(updateText(now: now))"
     }
 
     private var connectionText: String {
@@ -129,19 +258,16 @@ private struct HomeHeader: View {
         }
     }
 
-    private func syncText(now: Date) -> String {
-        if bluetooth.historicalSyncInProgress {
-            return "Syncing…"
+    private func updateText(now: Date) -> String {
+        guard let last = bluetooth.lastDataUpdatedAt else {
+            return "No data yet"
         }
-        guard let last = bluetooth.lastHistoricalSyncAt else {
-            return "Never synced"
-        }
-        return "Last synced \(Self.compactRelativeTime(from: last, to: now))"
+        return "Updated \(Self.compactRelativeTime(from: last, to: now))"
     }
 
     private static func compactRelativeTime(from date: Date, to now: Date) -> String {
         let seconds = max(0, Int(now.timeIntervalSince(date)))
-        if seconds < 60 { return "just now" }
+        if seconds < 60 { return "now" }
 
         let minutes = seconds / 60
         if minutes < 60 { return "\(minutes)m ago" }

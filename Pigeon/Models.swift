@@ -1,6 +1,84 @@
 import Foundation
 import SwiftData
 
+enum StrainScore {
+    static let method = "strain_v1"
+    static let restingHRFallback = 60.0
+    static let maxHRFallback = 190.0
+    static let maxSampleGapSeconds = 120.0
+    static let loadScale = 55.0
+
+    static func loadIncrement(bpm: Int, durationSeconds: TimeInterval) -> Double {
+        guard durationSeconds > 0 else { return 0 }
+        let reserve = maxHRFallback - restingHRFallback
+        guard reserve > 0 else { return 0 }
+        let intensity = max(0, min(1.5, (Double(bpm) - restingHRFallback) / reserve))
+        return pow(intensity, 1.67) * (durationSeconds / 60.0)
+    }
+
+    static func score(from load: Double) -> Double {
+        guard load > 0 else { return 0 }
+        return min(21.0, 21.0 * (1.0 - exp(-load / loadScale)))
+    }
+
+    /// WHOOP strain zone label for a 0–21 score.
+    static func categoryLabel(for score: Double) -> String {
+        zone(for: score).label
+    }
+
+    static func zone(for score: Double) -> StrainZoneInfo {
+        zones.first { score < $0.upperBound } ?? zones[zones.count - 1]
+    }
+
+    static let maxScore = 21.0
+
+    static let zones: [StrainZoneInfo] = [
+        StrainZoneInfo(label: "Light", lowerBound: 0, upperBound: 10),
+        StrainZoneInfo(label: "Moderate", lowerBound: 10, upperBound: 14),
+        StrainZoneInfo(label: "High", lowerBound: 14, upperBound: 18),
+        StrainZoneInfo(label: "All Out", lowerBound: 18, upperBound: 21),
+    ]
+}
+
+struct StrainZoneInfo: Identifiable {
+    let label: String
+    let lowerBound: Double
+    let upperBound: Double
+
+    var id: String { label }
+
+    var widthFraction: Double {
+        (upperBound - lowerBound) / StrainScore.maxScore
+    }
+}
+
+// WHOOP-style cardiovascular strain approximation. This is not WHOOP's
+// proprietary model; it is a local HR-reserve/TRIMP-inspired daily load.
+@Model
+final class DailyStrainSummary {
+    var date: Date
+    var method: String
+    var sampleCount: Int
+    var activeSeconds: Double
+    var strainLoad: Double
+    var score: Double
+    var minHR: Int
+    var maxHR: Int
+    var lastSampleAt: Date?
+
+    init(date: Date) {
+        self.date = date
+        self.method = StrainScore.method
+        self.sampleCount = 0
+        self.activeSeconds = 0
+        self.strainLoad = 0
+        self.score = 0
+        self.minHR = 0
+        self.maxHR = 0
+        self.lastSampleAt = nil
+    }
+}
+
 // Pre-aggregated daily summary. One row per calendar day.
 // Updated in-place on every raw-sample write so reads never scan HRSample.
 @Model

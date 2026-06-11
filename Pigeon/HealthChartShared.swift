@@ -18,6 +18,7 @@ struct HomeScoreCard: View {
     let unitText: String
     var isAvailable: Bool = true
     var showsChevron: Bool = false
+    var centerScore: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -41,21 +42,22 @@ struct HomeScoreCard: View {
             Group {
                 if isAvailable {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
-                        Text(scoreText)
-                            .font(.system(size: 28, weight: .bold))
-                            .foregroundColor(.primary)
-                            .monospacedDigit()
-                        Text(unitText)
-                            .font(.system(size: 15, weight: .medium))
-                            .foregroundColor(.secondary)
+                        scoreValueText
+                        if !unitText.isEmpty {
+                            Text(unitText)
+                                .font(.system(size: 15, weight: .medium))
+                                .foregroundColor(.secondary)
+                        }
                     }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: centerScore ? .center : .topLeading)
                 } else {
                     Text("Not Available")
                         .font(.system(size: 15, weight: .medium))
                         .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
                 }
             }
-            .frame(height: 34, alignment: .topLeading)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(maxWidth: .infinity, minHeight: Self.height, alignment: .topLeading)
         .padding(14)
@@ -66,6 +68,21 @@ struct HomeScoreCard: View {
     }
 
     static let height: CGFloat = 112
+
+    @ViewBuilder
+    private var scoreValueText: some View {
+        let text = Text(scoreText)
+            .font(.system(size: 28, weight: .bold))
+            .foregroundColor(.primary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+
+        if centerScore {
+            text
+        } else {
+            text.monospacedDigit()
+        }
+    }
 }
 
 enum HealthTimeRange: String, CaseIterable, Identifiable {

@@ -101,6 +101,7 @@ class BluetoothManager: NSObject, ObservableObject {
     @Published private(set) var historicalSyncPackets = 0
     @Published private(set) var historicalTemperaturePackets = 0
     @Published private(set) var lastHistoricalSyncAt: Date?
+    @Published private(set) var lastDataUpdatedAt: Date?
     private var historyEndAckedThisBatch = false
     private var historicalUnsavedSincePersist = 0
     private var historicalTouchedHours: Set<Date> = []
@@ -115,6 +116,8 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let skinTemperatureHourlyBackfillKey = "pigeon.skinTemperatureHourlyBackfillVersion"
     private static let skinTemperatureHourlyBackfillVersion = 1
     private static let skinTemperatureSchemaField = "whoop5_v18_frame_73_skin_temp_raw"
+    private static let dailyStrainBackfillKey = "pigeon.dailyStrainBackfillVersion"
+    private static let dailyStrainBackfillVersion = 2
 
     // Step 2a — dump one K=18 body hex per drain so we can keep eyeballing
     // header layout vs Goose's protocol.rs:496-510 if anything looks off.
@@ -161,7 +164,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let sleepWindowBackfillKey = "pigeon.sleepWindowBackfillVersion"
     private static let sleepWindowBackfillVersion = 5
     private static let recoveryBackfillKey = "pigeon.recoveryBackfillVersion"
-    private static let recoveryBackfillVersion = 1
+    private static let recoveryBackfillVersion = 2
     private static let sleepWindowBucketSeconds = 10 * 60
     private static let sleepSearchStartOffset: TimeInterval = -6 * 60 * 60
     private static let sleepSearchEndOffset: TimeInterval = 14 * 60 * 60
@@ -188,6 +191,14 @@ class BluetoothManager: NSObject, ObservableObject {
     private static let sleepWakeHRSustainedSeconds: TimeInterval = 8 * 60
     private var lastRealtimeHRNudgeAt: Date?
     private var lastSleepWindowRefreshAt: Date?
+    private var pendingStrainDays: Set<Date> = []
+    private var strainRefreshWorkItem: DispatchWorkItem?
+    private var startupMaintenanceStarted = false
+    private static let startupMaintenanceInitialDelay: TimeInterval = 0.75
+    private static let startupMaintenanceStepDelay: TimeInterval = 0.35
+    private static let startupMaintenanceChunkDelay: TimeInterval = 0.03
+    private static let startupMaintenanceFetchLimit = 250
+    private static let strainRefreshInterval: TimeInterval = 15 * 60
 
     private var whoopServiceUUIDs: [CBUUID] {
         [whoopServiceGen5, whoopServiceGen4]
@@ -209,17 +220,95 @@ class BluetoothManager: NSObject, ObservableObject {
         self.modelContext = ModelContext(modelContainer)
         super.init()
         lastHistoricalSyncAt = UserDefaults.standard.object(forKey: Self.lastHistoricalSyncKey) as? Date
-        backfillHourlySummariesIfNeeded()
-        backfillMotionBucketSummariesIfNeeded()
-        backfillSleepWindowSummariesIfNeeded()
-        backfillRecoverySummariesIfNeeded()
-        purgeImplausibleSkinTemperatureSamplesIfNeeded()
-        backfillSkinTemperatureHourlySummariesIfNeeded()
+        lastDataUpdatedAt = fetchLatestDataTimestamp()
         centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
             options: [CBCentralManagerOptionRestoreIdentifierKey: Self.centralRestoreIdentifier]
         )
+    }
+
+    func runStartupMaintenanceAfterFirstRender() {
+        guard !startupMaintenanceStarted else { return }
+        startupMaintenanceStarted = true
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupMaintenanceInitialDelay) { [weak self] in
+            self?.runStartupMaintenanceStep(0)
+        }
+    }
+
+    private typealias StartupMaintenanceWork = (@escaping () -> Void) -> Void
+
+    private func runStartupMaintenanceStep(_ index: Int) {
+        let steps: [(name: String, work: StartupMaintenanceWork)] = [
+            ("hourly summaries", { completion in
+                self.backfillHourlySummariesIfNeeded()
+                completion()
+            }),
+            ("strain summaries", { completion in
+                self.backfillDailyStrainSummariesCooperatively(completion: completion)
+            }),
+            ("motion bucket summaries", { completion in
+                self.backfillMotionBucketSummariesCooperatively(completion: completion)
+            }),
+            ("sleep window summaries", { completion in
+                self.backfillSleepWindowSummariesCooperatively(completion: completion)
+            }),
+            ("recovery summaries", { completion in
+                self.backfillRecoverySummariesCooperatively(completion: completion)
+            }),
+            ("skin temperature cleanup", { completion in
+                self.purgeImplausibleSkinTemperatureSamplesCooperatively(completion: completion)
+            }),
+            ("skin temperature hourly summaries", { completion in
+                self.backfillSkinTemperatureHourlySummariesCooperatively(completion: completion)
+            })
+        ]
+
+        guard index < steps.count else {
+            logOK("Startup maintenance complete", tag: "MAINT")
+            return
+        }
+
+        let step = steps[index]
+        let startedAt = Date()
+        logInfo("Startup maintenance: \(step.name) started", tag: "MAINT")
+        step.work { [weak self] in
+            guard let self else { return }
+            let elapsed = Date().timeIntervalSince(startedAt)
+            self.logOK("Startup maintenance: \(step.name) finished in \(String(format: "%.2f", elapsed))s", tag: "MAINT")
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupMaintenanceStepDelay) { [weak self] in
+                self?.runStartupMaintenanceStep(index + 1)
+            }
+        }
+    }
+
+    private func scheduleStartupMaintenanceChunk(_ work: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.startupMaintenanceChunkDelay, execute: work)
+    }
+
+    private func noteDataUpdated(at timestamp: Date) {
+        guard lastDataUpdatedAt.map({ timestamp > $0 }) ?? true else { return }
+        lastDataUpdatedAt = timestamp
+    }
+
+    private func fetchLatestDataTimestamp() -> Date? {
+        [
+            latestTimestamp(for: HRSample.self, keyPath: \.timestamp),
+            latestTimestamp(for: RRSample.self, keyPath: \.timestamp),
+            latestTimestamp(for: HRVSample.self, keyPath: \.timestamp),
+            latestTimestamp(for: MotionSample.self, keyPath: \.timestamp),
+            latestTimestamp(for: SkinTemperatureSample.self, keyPath: \.timestamp)
+        ]
+            .compactMap { $0 }
+            .max()
+    }
+
+    private func latestTimestamp<T: PersistentModel>(for modelType: T.Type, keyPath: KeyPath<T, Date>) -> Date? {
+        var descriptor = FetchDescriptor<T>(sortBy: [SortDescriptor(keyPath, order: .reverse)])
+        descriptor.fetchLimit = 1
+        return (try? modelContext.fetch(descriptor))?.first?[keyPath: keyPath]
     }
 
     func startScanning() {
@@ -518,6 +607,7 @@ class BluetoothManager: NSObject, ObservableObject {
         }
 
         modelContext.insert(HRSample(timestamp: timestamp, bpm: bpm, sourceKey: key))
+        noteDataUpdated(at: timestamp)
         historicalTouchedHours.insert(hourStart(of: timestamp))
         historicalTouchedDays.insert(Calendar.current.startOfDay(for: timestamp))
         historicalSyncPackets += 1
@@ -572,6 +662,7 @@ class BluetoothManager: NSObject, ObservableObject {
             semanticStatus: candidate.semanticStatus,
             sourceKey: key
         ))
+        noteDataUpdated(at: timestamp)
         updateSkinTemperatureHourlySummary(celsius: candidate.celsius, rawU16: candidate.rawU16LE, at: timestamp)
 
         historicalTemperaturePackets += 1
@@ -705,6 +796,7 @@ class BluetoothManager: NSObject, ObservableObject {
             rebuildMonthlySummary(for: day)
         }
         try? modelContext.save()
+        rebuildDailyStrainSummariesInBackground(for: days)
 
         historicalSyncInProgress = false
         historicalTouchedHours.removeAll()
@@ -753,6 +845,10 @@ class BluetoothManager: NSObject, ObservableObject {
         summary.maxHR = hrSamples.map(\.bpm).max() ?? 0
         summary.hrvSampleCount = hrvSamples.count
         summary.sumHRV = hrvSamples.reduce(0.0) { $0 + $1.rmssdMS }
+    }
+
+    private func rebuildDailyStrainSummaryFromSamples(for dayStart: Date) {
+        Self.rebuildDailyStrainSummary(for: dayStart, in: modelContext)
     }
 
     private func writeCommand(_ frame: Data, to peripheral: CBPeripheral, characteristic: CBCharacteristic) {
@@ -1641,8 +1737,10 @@ extension BluetoothManager: CBPeripheralDelegate {
     private func persistHeartRateSample(_ bpm: Int) {
         let now = Date()
         modelContext.insert(HRSample(timestamp: now, bpm: bpm))
+        noteDataUpdated(at: now)
         updateHourlySummary(bpm: bpm, at: now)
         updateDailySummary(bpm: bpm, at: now)
+        scheduleStrainSummaryRefresh(for: now)
         refreshSleepWindowSummariesAround(now)
     }
 
@@ -1666,6 +1764,7 @@ extension BluetoothManager: CBPeripheralDelegate {
             maxDeltaG: frame.maxDeltaG,
             sourceKey: "raw43:\(frame.deviceTimestamp):\(frame.subseconds):\(frame.recordHeader)"
         ))
+        noteDataUpdated(at: timestamp)
         updateMotionBucketSummaries(
             timestamp: timestamp,
             meanDeltaG: frame.meanDeltaG,
@@ -1742,6 +1841,43 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.sumHR += Double(bpm)
         summary.hrSampleCount += 1
         rebuildMonthlySummary(for: today)
+    }
+
+    private func updateDailyStrain(bpm: Int, at timestamp: Date) {
+        let day = Calendar.current.startOfDay(for: timestamp)
+        let summary = fetchOrCreateDailyStrainSummary(for: day)
+        Self.applyStrainSample(bpm: bpm, at: timestamp, to: summary)
+    }
+
+    private func scheduleStrainSummaryRefresh(for timestamp: Date) {
+        let day = Calendar.current.startOfDay(for: timestamp)
+        pendingStrainDays.insert(day)
+        guard strainRefreshWorkItem == nil else { return }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.runScheduledStrainRefresh()
+        }
+        strainRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.strainRefreshInterval, execute: workItem)
+    }
+
+    private func runScheduledStrainRefresh() {
+        let days = pendingStrainDays
+        pendingStrainDays.removeAll()
+        strainRefreshWorkItem = nil
+        rebuildDailyStrainSummariesInBackground(for: days)
+    }
+
+    private func rebuildDailyStrainSummariesInBackground(for days: Set<Date>) {
+        guard !days.isEmpty else { return }
+        let modelContainer = modelContainer
+        Task.detached(priority: .utility) {
+            let context = ModelContext(modelContainer)
+            for day in days.sorted() {
+                Self.rebuildDailyStrainSummary(for: day, in: context)
+            }
+            try? context.save()
+        }
     }
 
     private func updateDailySummaryHRV(_ rmssd: Double) {
@@ -1875,6 +2011,151 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
 
         try? modelContext.save()
+    }
+
+    private func backfillDailyStrainSummariesCooperatively(completion: @escaping () -> Void) {
+        let version = UserDefaults.standard.integer(forKey: Self.dailyStrainBackfillKey)
+        guard version < Self.dailyStrainBackfillVersion else {
+            completion()
+            return
+        }
+
+        deleteDailyStrainSummaries()
+        let descriptor = FetchDescriptor<DailySummary>(
+            predicate: #Predicate { $0.hrSampleCount > 0 },
+            sortBy: [SortDescriptor(\.date)]
+        )
+        let days = ((try? modelContext.fetch(descriptor)) ?? []).map(\.date)
+        processDailyStrainBackfill(days: days, index: 0, completion: completion)
+    }
+
+    private func processDailyStrainBackfill(
+        days: [Date],
+        index: Int,
+        completion: @escaping () -> Void
+    ) {
+        guard index < days.count else {
+            try? modelContext.save()
+            UserDefaults.standard.set(Self.dailyStrainBackfillVersion, forKey: Self.dailyStrainBackfillKey)
+            completion()
+            return
+        }
+
+        rebuildDailyStrainSummaryFromSamples(for: days[index])
+        try? modelContext.save()
+
+        scheduleStartupMaintenanceChunk { [weak self] in
+            self?.processDailyStrainBackfill(days: days, index: index + 1, completion: completion)
+        }
+    }
+
+    private func deleteDailyStrainSummaries() {
+        let descriptor = FetchDescriptor<DailyStrainSummary>()
+        let summaries = (try? modelContext.fetch(descriptor)) ?? []
+        for summary in summaries {
+            modelContext.delete(summary)
+        }
+    }
+
+    private func backfillMotionBucketSummariesCooperatively(completion: @escaping () -> Void) {
+        let missingBucketSizes = Self.motionBucketSeconds.filter { seconds in
+            let descriptor = FetchDescriptor<MotionBucketSummary>(
+                predicate: #Predicate { $0.bucketSeconds == seconds }
+            )
+            return ((try? modelContext.fetchCount(descriptor)) ?? 0) == 0
+        }
+        guard !missingBucketSizes.isEmpty else {
+            completion()
+            return
+        }
+
+        processMotionBucketBackfill(
+            missingBucketSizes: missingBucketSizes,
+            bucketIndex: 0,
+            offset: 0,
+            summaries: [:],
+            completion: completion
+        )
+    }
+
+    private func processMotionBucketBackfill(
+        missingBucketSizes: [Int],
+        bucketIndex: Int,
+        offset: Int,
+        summaries: [Date: MotionBucketSummary],
+        completion: @escaping () -> Void
+    ) {
+        guard bucketIndex < missingBucketSizes.count else {
+            try? modelContext.save()
+            completion()
+            return
+        }
+
+        let seconds = missingBucketSizes[bucketIndex]
+        var descriptor = FetchDescriptor<MotionSample>(
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        descriptor.fetchLimit = Self.startupMaintenanceFetchLimit
+        descriptor.fetchOffset = offset
+
+        let samples = (try? modelContext.fetch(descriptor)) ?? []
+        guard !samples.isEmpty else {
+            try? modelContext.save()
+            scheduleStartupMaintenanceChunk { [weak self] in
+                self?.processMotionBucketBackfill(
+                    missingBucketSizes: missingBucketSizes,
+                    bucketIndex: bucketIndex + 1,
+                    offset: 0,
+                    summaries: [:],
+                    completion: completion
+                )
+            }
+            return
+        }
+
+        var updatedSummaries = summaries
+        for sample in samples {
+            let bucketStart = motionBucketStart(of: sample.timestamp, seconds: seconds)
+            let summary: MotionBucketSummary
+            if let existing = updatedSummaries[bucketStart] {
+                summary = existing
+            } else {
+                let created = MotionBucketSummary(bucketStart: bucketStart, bucketSeconds: seconds)
+                modelContext.insert(created)
+                updatedSummaries[bucketStart] = created
+                summary = created
+            }
+
+            summary.sampleCount += 1
+            summary.sumMeanDeltaG += sample.meanDeltaG
+            summary.maxDeltaG = max(summary.maxDeltaG, sample.maxDeltaG)
+            if MotionStillness.isStill(meanDeltaG: sample.meanDeltaG, rmsDeviationG: sample.rmsDeviationG) {
+                summary.stillCount += 1
+            }
+
+            if let first = summary.firstSampleAt {
+                summary.firstSampleAt = min(first, sample.timestamp)
+            } else {
+                summary.firstSampleAt = sample.timestamp
+            }
+
+            if let last = summary.lastSampleAt {
+                summary.lastSampleAt = max(last, sample.timestamp)
+            } else {
+                summary.lastSampleAt = sample.timestamp
+            }
+        }
+
+        try? modelContext.save()
+        scheduleStartupMaintenanceChunk { [weak self] in
+            self?.processMotionBucketBackfill(
+                missingBucketSizes: missingBucketSizes,
+                bucketIndex: bucketIndex,
+                offset: offset + samples.count,
+                summaries: updatedSummaries,
+                completion: completion
+            )
+        }
     }
 
     private func backfillMotionBucketSummariesIfNeeded() {
@@ -2579,7 +2860,15 @@ extension BluetoothManager: CBPeripheralDelegate {
             }
         )
         let rows = (try? modelContext.fetch(descriptor)) ?? []
-        let eligible = rows.filter { $0.rhrBPM > 0 && $0.sleepMinutes > 0 && $0.hrvMS > 0 }
+        let eligible = rows.filter { row in
+            guard row.rhrBPM > 0,
+                  row.sleepMinutes > 0,
+                  row.hrvMS > 0,
+                  let window = fetchSleepWindowSummary(forWakeDay: row.day) else {
+                return false
+            }
+            return window.confidence >= SleepWindowDetection.minimumConfidence
+        }
         guard !eligible.isEmpty else {
             return RecoveryScore.Baseline(hrvMS: 0, rhrBPM: 0, sleepMinutes: 0, dayCount: 0)
         }
@@ -2648,6 +2937,47 @@ extension BluetoothManager: CBPeripheralDelegate {
         summary.sleepComponent = computed?.sleepComponent ?? 0
     }
 
+    private func backfillRecoverySummariesCooperatively(completion: @escaping () -> Void) {
+        let version = UserDefaults.standard.integer(forKey: Self.recoveryBackfillKey)
+        guard version < Self.recoveryBackfillVersion else {
+            completion()
+            return
+        }
+
+        let descriptor = FetchDescriptor<SleepWindowSummary>(
+            sortBy: [SortDescriptor(\.day)]
+        )
+        guard let windows = try? modelContext.fetch(descriptor), !windows.isEmpty else {
+            completion()
+            return
+        }
+
+        processRecoveryBackfill(windows: windows, index: 0, completion: completion)
+    }
+
+    private func processRecoveryBackfill(
+        windows: [SleepWindowSummary],
+        index: Int,
+        completion: @escaping () -> Void
+    ) {
+        guard index < windows.count else {
+            try? modelContext.save()
+            UserDefaults.standard.set(Self.recoveryBackfillVersion, forKey: Self.recoveryBackfillKey)
+            completion()
+            return
+        }
+
+        let end = min(index + 2, windows.count)
+        for window in windows[index..<end] {
+            rebuildRecoverySummary(forWakeDay: window.day)
+        }
+        try? modelContext.save()
+
+        scheduleStartupMaintenanceChunk { [weak self] in
+            self?.processRecoveryBackfill(windows: windows, index: end, completion: completion)
+        }
+    }
+
     private func backfillRecoverySummariesIfNeeded() {
         let version = UserDefaults.standard.integer(forKey: Self.recoveryBackfillKey)
         guard version < Self.recoveryBackfillVersion else { return }
@@ -2662,6 +2992,11 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
         try? modelContext.save()
         UserDefaults.standard.set(Self.recoveryBackfillVersion, forKey: Self.recoveryBackfillKey)
+    }
+
+    private func purgeImplausibleSkinTemperatureSamplesCooperatively(completion: @escaping () -> Void) {
+        purgeImplausibleSkinTemperatureSamplesIfNeeded()
+        completion()
     }
 
     private func purgeImplausibleSkinTemperatureSamplesIfNeeded() {
@@ -2684,6 +3019,43 @@ extension BluetoothManager: CBPeripheralDelegate {
             logInfo("Removed \(deleted) implausible skin temperature candidate\(deleted == 1 ? "" : "s")", tag: "SYNC")
         }
         UserDefaults.standard.set(Self.skinTemperatureCleanupVersion, forKey: Self.skinTemperatureCleanupKey)
+    }
+
+    private func backfillSkinTemperatureHourlySummariesCooperatively(completion: @escaping () -> Void) {
+        let version = UserDefaults.standard.integer(forKey: Self.skinTemperatureHourlyBackfillKey)
+        guard version < Self.skinTemperatureHourlyBackfillVersion else {
+            completion()
+            return
+        }
+
+        deleteSkinTemperatureHourlySummaries()
+        processSkinTemperatureHourlyBackfill(offset: 0, completion: completion)
+    }
+
+    private func processSkinTemperatureHourlyBackfill(offset: Int, completion: @escaping () -> Void) {
+        var descriptor = FetchDescriptor<SkinTemperatureSample>(
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        descriptor.fetchLimit = Self.startupMaintenanceFetchLimit
+        descriptor.fetchOffset = offset
+
+        let rows = (try? modelContext.fetch(descriptor)) ?? []
+        guard !rows.isEmpty else {
+            try? modelContext.save()
+            UserDefaults.standard.set(Self.skinTemperatureHourlyBackfillVersion, forKey: Self.skinTemperatureHourlyBackfillKey)
+            completion()
+            return
+        }
+
+        for row in rows where row.semanticStatus == "plausible_unverified_scale" && row.schemaField == Self.skinTemperatureSchemaField {
+            guard let celsius = row.celsius else { continue }
+            updateSkinTemperatureHourlySummary(celsius: celsius, rawU16: row.rawU16LE, at: row.timestamp)
+        }
+
+        try? modelContext.save()
+        scheduleStartupMaintenanceChunk { [weak self] in
+            self?.processSkinTemperatureHourlyBackfill(offset: offset + rows.count, completion: completion)
+        }
     }
 
     private func backfillSkinTemperatureHourlySummariesIfNeeded() {
@@ -2710,6 +3082,61 @@ extension BluetoothManager: CBPeripheralDelegate {
         let summaries = (try? modelContext.fetch(descriptor)) ?? []
         for summary in summaries {
             modelContext.delete(summary)
+        }
+    }
+
+    private func backfillSleepWindowSummariesCooperatively(completion: @escaping () -> Void) {
+        let version = UserDefaults.standard.integer(forKey: Self.sleepWindowBackfillKey)
+        guard version < Self.sleepWindowBackfillVersion else {
+            completion()
+            return
+        }
+
+        let bucketSeconds = Self.sleepWindowBucketSeconds
+        let descriptor = FetchDescriptor<MotionBucketSummary>(
+            predicate: #Predicate { $0.bucketSeconds == bucketSeconds },
+            sortBy: [SortDescriptor(\.bucketStart)]
+        )
+        let buckets = (try? modelContext.fetch(descriptor)) ?? []
+        guard !buckets.isEmpty else {
+            completion()
+            return
+        }
+
+        let calendar = Calendar.current
+        var days = Set<Date>()
+        for bucket in buckets {
+            let day = calendar.startOfDay(for: bucket.bucketStart)
+            days.insert(day)
+            if let nextDay = calendar.date(byAdding: .day, value: 1, to: day) {
+                days.insert(nextDay)
+            }
+        }
+
+        processSleepWindowBackfill(days: days.sorted(), index: 0, completion: completion)
+    }
+
+    private func processSleepWindowBackfill(
+        days: [Date],
+        index: Int,
+        completion: @escaping () -> Void
+    ) {
+        guard index < days.count else {
+            try? modelContext.save()
+            UserDefaults.standard.set(Self.sleepWindowBackfillVersion, forKey: Self.sleepWindowBackfillKey)
+            completion()
+            return
+        }
+
+        let end = min(index + 1, days.count)
+        for day in days[index..<end] {
+            refreshSleepWindowSummary(forWakeDay: day)
+            rebuildMonthlySummary(for: day)
+        }
+        try? modelContext.save()
+
+        scheduleStartupMaintenanceChunk { [weak self] in
+            self?.processSleepWindowBackfill(days: days, index: end, completion: completion)
         }
     }
 
@@ -2741,7 +3168,6 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
         try? modelContext.save()
         UserDefaults.standard.set(Self.sleepWindowBackfillVersion, forKey: Self.sleepWindowBackfillKey)
-        backfillRecoverySummariesIfNeeded()
     }
 
     private func fetchOrCreateDailySummary(for startOfDay: Date) -> DailySummary {
@@ -2754,6 +3180,79 @@ extension BluetoothManager: CBPeripheralDelegate {
         let summary = DailySummary(date: startOfDay)
         modelContext.insert(summary)
         return summary
+    }
+
+    private func fetchOrCreateDailyStrainSummary(for startOfDay: Date) -> DailyStrainSummary {
+        let descriptor = FetchDescriptor<DailyStrainSummary>(
+            predicate: #Predicate { $0.date == startOfDay }
+        )
+        if let existing = (try? modelContext.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = DailyStrainSummary(date: startOfDay)
+        modelContext.insert(summary)
+        return summary
+    }
+
+    private static func rebuildDailyStrainSummary(for dayStart: Date, in context: ModelContext) {
+        guard let dayEnd = Calendar.current.date(byAdding: .day, value: 1, to: dayStart) else { return }
+        let descriptor = FetchDescriptor<HRSample>(
+            predicate: #Predicate { $0.timestamp >= dayStart && $0.timestamp < dayEnd },
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        let samples = (try? context.fetch(descriptor)) ?? []
+        let summary = fetchOrCreateDailyStrainSummary(for: dayStart, in: context)
+        resetDailyStrainSummary(summary)
+        for sample in samples {
+            applyStrainSample(bpm: sample.bpm, at: sample.timestamp, to: summary)
+        }
+    }
+
+    private static func fetchOrCreateDailyStrainSummary(
+        for startOfDay: Date,
+        in context: ModelContext
+    ) -> DailyStrainSummary {
+        let descriptor = FetchDescriptor<DailyStrainSummary>(
+            predicate: #Predicate { $0.date == startOfDay }
+        )
+        if let existing = (try? context.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = DailyStrainSummary(date: startOfDay)
+        context.insert(summary)
+        return summary
+    }
+
+    private static func resetDailyStrainSummary(_ summary: DailyStrainSummary) {
+        summary.method = StrainScore.method
+        summary.sampleCount = 0
+        summary.activeSeconds = 0
+        summary.strainLoad = 0
+        summary.score = 0
+        summary.minHR = 0
+        summary.maxHR = 0
+        summary.lastSampleAt = nil
+    }
+
+    private static func applyStrainSample(bpm: Int, at timestamp: Date, to summary: DailyStrainSummary) {
+        let duration: TimeInterval
+        if let last = summary.lastSampleAt,
+           Calendar.current.isDate(last, inSameDayAs: timestamp),
+           timestamp > last {
+            duration = min(timestamp.timeIntervalSince(last), StrainScore.maxSampleGapSeconds)
+        } else {
+            duration = 0
+        }
+
+        let load = StrainScore.loadIncrement(bpm: bpm, durationSeconds: duration)
+        summary.sampleCount += 1
+        summary.activeSeconds += duration
+        summary.strainLoad += load
+        summary.score = StrainScore.score(from: summary.strainLoad)
+        summary.minHR = summary.minHR == 0 ? bpm : min(summary.minHR, bpm)
+        summary.maxHR = max(summary.maxHR, bpm)
+        summary.lastSampleAt = max(summary.lastSampleAt ?? timestamp, timestamp)
+        summary.method = StrainScore.method
     }
 
     private func rebuildMonthlySummary(for day: Date) {
@@ -2803,6 +3302,7 @@ extension BluetoothManager: CBPeripheralDelegate {
             rrSessionSamples += 1
             // Persist the raw R-R interval — sparse and cheap.
             modelContext.insert(RRSample(timestamp: now, intervalMS: ms))
+            noteDataUpdated(at: now)
         }
 
         let cutoff = now.addingTimeInterval(-Self.hrvWindowSeconds)
@@ -2833,6 +3333,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         currentHRV = rmssd
         lastHRVUpdate = now
         modelContext.insert(HRVSample(timestamp: now, rmssdMS: rmssd))
+        noteDataUpdated(at: now)
         updateDailySummaryHRV(rmssd)
         updateHourlySummaryHRV(rmssd, at: now)
         refreshSleepWindowSummariesAround(now)

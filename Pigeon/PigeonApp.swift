@@ -12,6 +12,7 @@ struct PigeonApp: App {
                                                     SkinTemperatureHourlySummary.self,
                                                     MotionSample.self, MotionBucketSummary.self,
                                                     SleepWindowSummary.self, RecoverySummary.self,
+                                                    DailyStrainSummary.self,
                                                     HourlySummary.self, DailySummary.self,
                                                     MonthlySummary.self)
         } catch {

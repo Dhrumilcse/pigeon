@@ -20,5 +20,8 @@ struct ContentView: View {
                     Label("Settings", systemImage: "gear")
                 }
         }
+        .onAppear {
+            bluetooth.runStartupMaintenanceAfterFirstRender()
+        }
     }
 }
