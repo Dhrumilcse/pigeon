@@ -21,25 +21,10 @@ struct HomeScoreCard: View {
     var centerScore: Bool = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(tint)
-                Text(title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundColor(tint)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.85)
-                Spacer(minLength: 0)
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary.opacity(0.6))
-                    .opacity(showsChevron ? 1 : 0)
-            }
-            .frame(height: 18)
+        ZStack {
+            VStack(alignment: .leading, spacing: 16) {
+                headerRow
 
-            Group {
                 if isAvailable {
                     HStack(alignment: .firstTextBaseline, spacing: 3) {
                         scoreValueText
@@ -51,20 +36,42 @@ struct HomeScoreCard: View {
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: centerScore ? .center : .topLeading)
                 } else {
-                    Text("Not Available")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                    Spacer(minLength: 0)
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .frame(maxWidth: .infinity, minHeight: Self.height, alignment: .topLeading)
+
+            if !isAvailable {
+                Text("Not Available")
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
         }
-        .frame(maxWidth: .infinity, minHeight: Self.height, alignment: .topLeading)
+        .frame(maxWidth: .infinity, minHeight: Self.height)
         .padding(14)
         .background(
             RoundedRectangle(cornerRadius: 20, style: .continuous)
                 .fill(Color(.systemGray6))
         )
+    }
+
+    private var headerRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(tint)
+            Text(title)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundColor(tint)
+                .lineLimit(1)
+                .minimumScaleFactor(0.85)
+            Spacer(minLength: 0)
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.secondary.opacity(0.6))
+                .opacity(showsChevron ? 1 : 0)
+        }
+        .frame(height: 18)
     }
 
     static let height: CGFloat = 112

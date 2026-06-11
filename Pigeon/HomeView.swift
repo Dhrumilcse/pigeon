@@ -132,7 +132,7 @@ struct StrainCard: View {
 private struct StrainGaugeView: View {
     let score: Double
 
-    private static let barHeight: CGFloat = 13
+    private static let barHeight: CGFloat = 15
     private static let markerWidth: CGFloat = 2
     private static let markerExtension: CGFloat = 5
 
