@@ -1785,6 +1785,38 @@ extension BluetoothManager: CBPeripheralDelegate {
         return summary
     }
 
+    private func updateSkinTemperatureHourlySummary(celsius: Double, rawU16: Int?, at timestamp: Date) {
+        guard let rawU16 else { return }
+        let hourStart = hourStart(of: timestamp)
+        let summary = fetchOrCreateSkinTemperatureHourlySummary(for: hourStart)
+        if summary.sampleCount == 0 {
+            summary.minCelsius = celsius
+            summary.maxCelsius = celsius
+            summary.minRawU16 = rawU16
+            summary.maxRawU16 = rawU16
+        } else {
+            summary.minCelsius = min(summary.minCelsius, celsius)
+            summary.maxCelsius = max(summary.maxCelsius, celsius)
+            summary.minRawU16 = min(summary.minRawU16, rawU16)
+            summary.maxRawU16 = max(summary.maxRawU16, rawU16)
+        }
+        summary.sumCelsius += celsius
+        summary.sumRawU16 += Double(rawU16)
+        summary.sampleCount += 1
+    }
+
+    private func fetchOrCreateSkinTemperatureHourlySummary(for hourStart: Date) -> SkinTemperatureHourlySummary {
+        let descriptor = FetchDescriptor<SkinTemperatureHourlySummary>(
+            predicate: #Predicate { $0.hourStart == hourStart }
+        )
+        if let existing = (try? modelContext.fetch(descriptor))?.first {
+            return existing
+        }
+        let summary = SkinTemperatureHourlySummary(hourStart: hourStart)
+        modelContext.insert(summary)
+        return summary
+    }
+
     private func hourStart(of date: Date) -> Date {
         let cal = Calendar.current
         let comps = cal.dateComponents([.year, .month, .day, .hour], from: date)
@@ -2646,10 +2678,39 @@ extension BluetoothManager: CBPeripheralDelegate {
             deleted += 1
         }
         if deleted > 0 {
+            deleteSkinTemperatureHourlySummaries()
+            UserDefaults.standard.set(0, forKey: Self.skinTemperatureHourlyBackfillKey)
             try? modelContext.save()
             logInfo("Removed \(deleted) implausible skin temperature candidate\(deleted == 1 ? "" : "s")", tag: "SYNC")
         }
         UserDefaults.standard.set(Self.skinTemperatureCleanupVersion, forKey: Self.skinTemperatureCleanupKey)
+    }
+
+    private func backfillSkinTemperatureHourlySummariesIfNeeded() {
+        let version = UserDefaults.standard.integer(forKey: Self.skinTemperatureHourlyBackfillKey)
+        guard version < Self.skinTemperatureHourlyBackfillVersion else { return }
+
+        deleteSkinTemperatureHourlySummaries()
+
+        let descriptor = FetchDescriptor<SkinTemperatureSample>(
+            sortBy: [SortDescriptor(\.timestamp)]
+        )
+        let rows = (try? modelContext.fetch(descriptor)) ?? []
+        for row in rows where row.semanticStatus == "plausible_unverified_scale" && row.schemaField == Self.skinTemperatureSchemaField {
+            guard let celsius = row.celsius else { continue }
+            updateSkinTemperatureHourlySummary(celsius: celsius, rawU16: row.rawU16LE, at: row.timestamp)
+        }
+
+        try? modelContext.save()
+        UserDefaults.standard.set(Self.skinTemperatureHourlyBackfillVersion, forKey: Self.skinTemperatureHourlyBackfillKey)
+    }
+
+    private func deleteSkinTemperatureHourlySummaries() {
+        let descriptor = FetchDescriptor<SkinTemperatureHourlySummary>()
+        let summaries = (try? modelContext.fetch(descriptor)) ?? []
+        for summary in summaries {
+            modelContext.delete(summary)
+        }
     }
 
     private func backfillSleepWindowSummariesIfNeeded() {

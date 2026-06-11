@@ -9,6 +9,10 @@ struct LocalStorageView: View {
                     TableRowLabel(icon: "clock", color: .teal, name: "HourlySummary",
                                   subtitle: "Pre-aggregated HR per hour")
                 }
+                NavigationLink(destination: SkinTemperatureHourlySummaryTableView()) {
+                    TableRowLabel(icon: "thermometer.medium", color: .pink, name: "SkinTemperatureHourlySummary",
+                                  subtitle: "Pre-aggregated skin temperature per hour")
+                }
                 NavigationLink(destination: DailySummaryTableView()) {
                     TableRowLabel(icon: "calendar", color: .blue, name: "DailySummary",
                                   subtitle: "Pre-aggregated HR + HRV per day")
@@ -108,6 +112,53 @@ struct HourlySummaryTableView: View {
         }
         .listStyle(.insetGrouped)
         .navigationTitle("HourlySummary")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+struct SkinTemperatureHourlySummaryTableView: View {
+    @Query(sort: \SkinTemperatureHourlySummary.hourStart, order: .reverse) private var rows: [SkinTemperatureHourlySummary]
+
+    private static let schema: [(String, String)] = [
+        ("hourStart",    "Date — top of the hour, local time"),
+        ("sampleCount",  "Int — accepted skin temperature samples in this hour"),
+        ("sumCelsius",   "Double — running sum of decoded temperature"),
+        ("minCelsius",   "Double — lowest decoded temperature in hour"),
+        ("maxCelsius",   "Double — highest decoded temperature in hour"),
+        ("sumRawU16",    "Double — running sum of unsigned raw register values"),
+        ("minRawU16",    "Int — lowest unsigned raw register value in hour"),
+        ("maxRawU16",    "Int — highest unsigned raw register value in hour"),
+        ("avgCelsius",   "Double? (computed) — sumCelsius / sampleCount"),
+        ("avgRawU16",    "Double? (computed) — sumRawU16 / sampleCount"),
+    ]
+
+    private static let hourFmt: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d, h a"; return f
+    }()
+
+    var body: some View {
+        List {
+            SchemaSection(fields: Self.schema)
+            Section(header: Text("Last 50 of \(rows.count)")) {
+                if rows.isEmpty {
+                    Text("No data yet").foregroundStyle(.secondary)
+                }
+                ForEach(rows.prefix(50)) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(Self.hourFmt.string(from: row.hourStart))
+                            .font(.headline)
+                        KV("samples", "\(row.sampleCount)")
+                        KV("avg_temp", row.avgCelsius.map { String(format: "%.2f C", $0) } ?? "—")
+                        KV("min/max_temp", row.sampleCount > 0 ? String(format: "%.2f / %.2f C", row.minCelsius, row.maxCelsius) : "—")
+                        KV("avg_raw", row.avgRawU16.map { String(format: "%.1f", $0) } ?? "—")
+                        KV("min/max_raw", row.sampleCount > 0 ? "\(row.minRawU16) / \(row.maxRawU16)" : "—")
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle("SkinTemperatureHourlySummary")
         .navigationBarTitleDisplayMode(.inline)
     }
 }
@@ -483,7 +534,7 @@ struct SkinTemperatureSampleTableView: View {
         ("timestamp",     "Date — historical packet timestamp from the strap"),
         ("celsius",       "Double? — decoded temperature candidate"),
         ("packetK",       "Int — source historical packet family"),
-        ("schemaField",   "String — candidate mapping name from Goose"),
+        ("schemaField",   "String — Noop-derived WHOOP5 historical mapping name"),
         ("rawBodyOffset", "Int — byte offset within Pigeon's WHOOP payload"),
         ("encoding",      "String — integer encoding and scale"),
         ("rawHex",        "String — original two bytes"),
